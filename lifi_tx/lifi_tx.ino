@@ -16,7 +16,7 @@ constexpr uint8_t TX_PIN = 13;                         // Цифровой пи�
 constexpr uint16_t BAUD_RATE = 20;                     // Скорость передачи: 20 бит/с
 constexpr uint32_t BIT_PERIOD_MS = 1000 / BAUD_RATE;   // Длительность одного бита: 50 мс
 
-// Межсимвольная пауза (Guard Interval) для идеальной синхронизации длинных слов
+// Межсимвольная пауза (Guard Interval) для надежной синхронизации
 constexpr uint32_t INTER_BYTE_DELAY_MS = BIT_PERIOD_MS; // 50 мс темноты между символами
 
 // ==========================================
@@ -31,7 +31,7 @@ void sendString(const char* str);
 // ==========================================
 void setup() {
     pinMode(TX_PIN, OUTPUT);
-    digitalWrite(TX_PIN, LOW); // Линия в состоянии покоя (светодиод выключен)
+    digitalWrite(TX_PIN, LOW); // Линия в покое (LED выключен)
 
     Serial.begin(115200);
     delay(500);
@@ -39,16 +39,16 @@ void setup() {
     Serial.println(F("\n======================================================="));
     Serial.println(F("         >>> Li-Fi ПЕРЕДАТЧИК (TX) ГОТОВ <<<           "));
     Serial.println(F("======================================================="));
-    Serial.print(F("[INFO] Скорость: "));
+    Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
-    Serial.print(F(" бод (бит/с) | Длительность бита: "));
+    Serial.print(F(" бод (бит/с) | Бит: "));
     Serial.print(BIT_PERIOD_MS);
     Serial.println(F(" мс"));
     Serial.print(F("[INFO] Межсимвольная пауза: "));
     Serial.print(INTER_BYTE_DELAY_MS);
-    Serial.println(F(" мс (гарантия приема длинных слов)"));
+    Serial.println(F(" мс"));
     Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Введите любое слово или фразу в монитор порта и нажмите Enter:\n"));
+    Serial.println(F("Введите фразу из нескольких слов с пробелами и нажмите Enter:\n"));
 }
 
 // ==========================================
@@ -57,22 +57,22 @@ void setup() {
 void loop() {
     if (Serial.available() > 0) {
         String input = Serial.readStringUntil('\n');
-        input.trim(); // Убираем лишние пробелы и \r
+        input.trim();
         
         if (input.length() > 0) {
-            Serial.print(F("[TX] Отправка строки (длина: "));
+            Serial.print(F("\n[TX] Отправка сообщения (длина: "));
             Serial.print(input.length());
-            Serial.print(F("): \""));
+            Serial.print(F(" симв.): \""));
             Serial.print(input);
             Serial.println(F("\""));
             
-            // Передача каждого символа строки
+            // 1. Передача всех символов строки (включая пробелы между словами)
             sendString(input.c_str());
             
-            // Завершающий пробел в конце строки
-            sendByte(' ');
+            // 2. Отправка символа переноса строки (\n) как маркер ПОЛНОЙ ОСТАНОВКИ
+            sendByte('\n');
             
-            Serial.println(F("[TX] Отправка успешно завершена!\n"));
+            Serial.println(F("[TX] Сообщение успешно отправлено!\n"));
         }
     }
 }
@@ -89,18 +89,18 @@ void sendBit(bool bitVal) {
     digitalWrite(TX_PIN, bitVal ? HIGH : LOW);
     
     while (millis() - startTime < BIT_PERIOD_MS) {
-        // Выдержка битового интервала
+        // Ожидание периода бита
     }
 }
 
 /**
- * @brief Передача байта по протоколу UART (8-N-1) + Межсимвольная защитная пауза
+ * @brief Передача байта по протоколу UART (8-N-1) + Защитная пауза
  */
 void sendByte(uint8_t data) {
     // 1. СТАРТОВЫЙ БИТ (HIGH - световой импульс)
     sendBit(true);
 
-    // 2. 8 БИТ ДАННЫХ (LSB first - младшим битом вперед)
+    // 2. 8 БИТ ДАННЫХ (LSB first)
     for (uint8_t i = 0; i < 8; i++) {
         bool bit = (data >> i) & 0x01;
         sendBit(bit);
@@ -110,12 +110,11 @@ void sendByte(uint8_t data) {
     sendBit(false);
 
     // 4. МЕЖСИМВОЛЬНАЯ ЗАЩИТНАЯ ПАУЗА (LOW)
-    // Гарантирует, что RX успеет обработать символ и четко поймать передний фронт следующего
     delay(INTER_BYTE_DELAY_MS);
 }
 
 /**
- * @brief Передача строки любой длины
+ * @brief Передача строки
  */
 void sendString(const char* str) {
     while (*str) {
