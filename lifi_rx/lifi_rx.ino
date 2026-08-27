@@ -1,9 +1,11 @@
-// ============================================================================
-// ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
-// МОДУЛЬ: ПРИЕМНИК (RX) - СТАНДАРТ МАНЧЕСТЕР (IEEE 802.15.7) + ТЕЛЕМЕТРИЯ + CRC
-// ПЛАТФОРМА: Arduino Uno (ATmega328P)
-// ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор -> GND)
-// ============================================================================
+/*
+ * ============================================================================
+ * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
+ * МОДУЛЬ: ПРИЕМНИК (RX) - СТАНДАРТ МАНЧЕСТЕР (IEEE 802.15.7) + ТЕЛЕМЕТРИЯ + CRC
+ * ПЛАТФОРМА: Arduino Uno (ATmega328P)
+ * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор -> GND)
+ * ============================================================================
+ */
 
 #include <Arduino.h>
 
@@ -133,10 +135,12 @@ bool checkStartTrigger() {
     return (val > (ambientNoiseLevel + 12));
 }
 
-// Декодирование 1 Манчестер-байта:
-// Бит 1: Первая половина HIGH, Вторая половина LOW
-// Бит 0: Первая половина LOW, Вторая половина HIGH
-// Нарушение кода (Code Violation): если обе половины одинаковые
+/**
+ * @brief Декодирование 1 Манчестер-байта:
+ * Бит 1: Первая половина HIGH, Вторая половина LOW
+ * Бит 0: Первая половина LOW, Вторая половина HIGH
+ * Нарушение кода (Code Violation): если обе половины одинаковые (обе HIGH или обе LOW)
+ */
 bool receiveByteManchester(uint8_t& outByte) {
     uint32_t frameStartUs = micros();
 
@@ -150,7 +154,7 @@ bool receiveByteManchester(uint8_t& outByte) {
         return false; // Ложная помеха
     }
 
-    // Автоматическая адаптация порога прямо по синхро-биту
+    // Автоматическая адаптация порога прямо по синхро-биту!
     peakLightAdc = startSample;
     thresholdValue = (ambientNoiseLevel + peakLightAdc) / 2;
     hysteresisVal = max(4, (peakLightAdc - ambientNoiseLevel) / 10);
@@ -239,7 +243,9 @@ void processIncomingByte(uint8_t byteVal) {
     }
 }
 
-// Итоговый отчет: Сообщение + CRC-8 + Телеметрия Манчестера
+/**
+ * @brief Итоговый отчет: Сообщение + CRC-8 + Телеметрия Манчестера
+ */
 void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
     isReceivingMessage = false;
     rxState = STATE_PAYLOAD;
