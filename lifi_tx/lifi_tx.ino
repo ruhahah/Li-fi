@@ -1,9 +1,9 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПЕРЕДАТЧИК (TX)
+ * МОДУЛЬ: ПЕРЕДАТЧИК (TX) С ДЕТАЛЬНОЙ ВИЗУАЛИЗАЦИЕЙ ОТПРАВКИ
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
- * СВЕТОДИОД: KY-009 / Любой LED на Pin 13 (GND -> GND, Signal -> D13)
+ * СВЕТОДИОД: Светодиод / модуль на Pin 13 (GND -> GND, Signal -> D13)
  * ============================================================================
  */
 
@@ -27,48 +27,53 @@ void sendString(const char* str);
 // SETUP
 // ==========================================
 void setup() {
-    // Настройка пина TX на выход
     pinMode(TX_PIN, OUTPUT);
     digitalWrite(TX_PIN, LOW); // Линия в состоянии покоя (свет выключен)
 
-    // Инициализация аппаратного UART для монитора порта (управление и ввод)
     Serial.begin(115200);
-    while (!Serial && millis() < 2000); // Ожидание подключения Serial Monitor
+    while (!Serial && millis() < 2000);
 
-    Serial.println(F("========================================"));
-    Serial.println(F("    Li-Fi TRANSMITTER (TX) INITIALIZED  "));
-    Serial.println(F("========================================"));
-    Serial.print(F("Speed: "));
+    Serial.println(F("\n======================================================="));
+    Serial.println(F("       Li-Fi TRANSMITTER (TX) - READY TO TRANSMIT      "));
+    Serial.println(F("======================================================="));
+    Serial.print(F("[CONFIG] Speed: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" baud | Bit duration: "));
     Serial.print(BIT_PERIOD_MS);
     Serial.println(F(" ms"));
-    Serial.println(F("Frame format: 1 Start (HIGH) + 8 Data Bits (LSB first) + 1 Stop (LOW)"));
-    Serial.println(F("Mode: ON-DEMAND (Enter text in Serial Monitor and press Enter to transmit)"));
-    Serial.println(F("========================================\n"));
+    Serial.println(F("[CONFIG] TX Pin: D13 (LED)"));
+    Serial.println(F("[CONFIG] Frame format: START(1) + 8 DATA BITS (LSB) + STOP(0)"));
+    Serial.println(F("-------------------------------------------------------"));
+    Serial.println(F("Введите текст в строку ввода Serial Monitor и нажмите Enter:"));
+    Serial.println(F("=======================================================\n"));
 }
 
 // ==========================================
 // ГЛАВНЫЙ ЦИКЛ (LOOP)
 // ==========================================
 void loop() {
-    // Проверка ввода из Serial Monitor
     if (Serial.available() > 0) {
         String input = Serial.readStringUntil('\n');
-        input.trim(); // Удаляем пробелы и переносы на концах
+        input.trim();
         
         if (input.length() > 0) {
-            Serial.print(F("[TX Transmitting]: \""));
+            Serial.println(F("\n>>>>>>>>>>>> [ НАЧАЛО ПЕРЕДАЧИ ] >>>>>>>>>>>>"));
+            Serial.print(F("[TX ТЕКСТ]: \""));
             Serial.print(input);
-            Serial.println(F("\""));
+            Serial.print(F("\" (Длина: "));
+            Serial.print(input.length());
+            Serial.println(F(" симв.)"));
+            Serial.println(F("---------------------------------------------"));
             
-            // Передача введенной строки по оптическому каналу
+            // Передача каждого символа по оптическому каналу
             sendString(input.c_str());
             
-            // Отправляем пробел в конце для корректного завершения слова на стороне RX
+            // Завершающий пробел для сброса буфера на RX
             sendByte(' ');
             
-            Serial.println(F("[TX Done]: Transmission finished. Ready for next input.\n"));
+            Serial.println(F("---------------------------------------------"));
+            Serial.println(F("<<<<<<<<<<<< [ ПЕРЕДАЧА ЗАВЕРШЕНА ] <<<<<<<<<<<<\n"));
+            Serial.println(F("Готов к следующему сообщению...\n"));
         }
     }
 }
@@ -79,47 +84,51 @@ void loop() {
 
 /**
  * @brief Передача одного бита с точной выдержкой интервала времени.
- * @param bitVal Логическое значение бита (true = HIGH / LED ON, false = LOW / LED OFF).
  */
 void sendBit(bool bitVal) {
     uint32_t startTime = millis();
-    
-    // Модуляция OOK (On-Off Keying)
     digitalWrite(TX_PIN, bitVal ? HIGH : LOW);
     
-    // Блокирующая прецизионная задержка для сохранения стабильной фазы
     while (millis() - startTime < BIT_PERIOD_MS) {
-        // NOP (ждем завершения периода бита)
+        // Прецизионное ожидание периода бита
     }
 }
 
 /**
- * @brief Передача одного байта (символа) по протоколу 8-N-1 (с инверсным Idle = LOW).
- * 
- * Структура оптического кадра:
- * 1. START BIT = HIGH (1 период): вспышка света сигнализирует приемнику о начале кадра.
- * 2. 8 DATA BITS (LSB first): передача битов от младшего (bit 0) к старшему (bit 7).
- * 3. STOP BIT = LOW (1 период): выключение света для фиксации конца кадра и сброса линии.
- * 
- * @param data Передаваемый байт данных (ASCII символ).
+ * @brief Передача одного байта с подробным логом в Serial Monitor.
  */
 void sendByte(uint8_t data) {
-    // 1. СТАРТОВЫЙ БИТ (HIGH - свет включается)
+    char ch = static_cast<char>(data);
+    
+    Serial.print(F("[TX Символ]: '"));
+    if (ch >= 32 && ch <= 126) {
+        Serial.print(ch);
+    } else {
+        Serial.print(F("SPC"));
+    }
+    Serial.print(F("' | HEX: 0x"));
+    if (data < 16) Serial.print(F("0"));
+    Serial.print(data, HEX);
+    Serial.print(F(" | Биты: [START:1] -> "));
+
+    // 1. СТАРТОВЫЙ БИТ (HIGH)
     sendBit(true);
 
-    // 2. 8 БИТ ДАННЫХ (младшим битом вперед - LSB first)
+    // 2. 8 БИТ ДАННЫХ (LSB first)
     for (uint8_t i = 0; i < 8; i++) {
         bool bit = (data >> i) & 0x01;
+        Serial.print(bit ? '1' : '0');
+        Serial.print(F(" "));
         sendBit(bit);
     }
 
-    // 3. СТОПОВЫЙ БИТ (LOW - свет выключается)
+    // 3. СТОПОВЫЙ БИТ (LOW)
     sendBit(false);
+    Serial.println(F("-> [STOP:0] OK"));
 }
 
 /**
- * @brief Передача нуль-терминированной строки.
- * @param str Указатель на C-строку.
+ * @brief Передача строки.
  */
 void sendString(const char* str) {
     while (*str) {
