@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПРИЕМНИК (RX) - МИКРОСЕКУНДНАЯ СИНХРОНИЗАЦИЯ И ЕДИНАЯ СТРОКА
+ * МОДУЛЬ: ПРИЕМНИК (RX) - С ПРОВЕРКОЙ ЦЕЛОСТНОСТИ ДАННЫХ CRC-8
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор 10 кОм -> GND)
  * ============================================================================
@@ -13,21 +13,28 @@
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ
 // ==========================================
 constexpr uint8_t RX_PIN = A0;                         // Аналоговый вход фотодиода
-constexpr uint16_t BAUD_RATE = 20;                     // Скорость: 20 бит/с
+constexpr uint16_t BAUD_RATE = 20;                     // Скорость передачи: 20 бит/с
 constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // Длительность одного бита: 50 000 мкс (50 мс)
 
-// Буфер для сборки предложений любой длины с пробелами
+// Буфер для сборки предложения
 constexpr size_t BUFFER_SIZE = 256;
 char sentenceBuffer[BUFFER_SIZE];
 size_t bufferIndex = 0;
 
-// Таймаут тишины: 650 мс без новых импульсов = фраза полностью завершена
-constexpr uint32_t MESSAGE_TIMEOUT_MS = 650;
+// Таймаут тишины (окончание всей фразы): 800 мс
+constexpr uint32_t MESSAGE_TIMEOUT_MS = 800;
 uint32_t lastCharTime = 0;
-bool isReceivingPhrase = false;
+bool isReceivingMessage = false;
 
-// Порог срабатывания и калибровка
-int ambientNoiseLevel = 0;                              // Фоновый уровень темноты
+// Состояние приема пакета
+enum RxPacketState {
+    STATE_PAYLOAD,      // Прием полезного текста
+    STATE_WAIT_CRC      // Ожидание контрольного байта CRC-8
+};
+RxPacketState rxState = STATE_PAYLOAD;
+
+// Порог срабатывания и параметры калибровки
+int ambientNoiseLevel = 0;                              // Базовый уровень шума (темнота)
 int thresholdValue = 60;                               // Порог переключения (ADC 0..1023)
 constexpr int NOISE_MARGIN = 40;                        // Запас над шумом
 constexpr int HYSTERESIS = 12;                          // Гистерезис
@@ -35,11 +42,13 @@ constexpr int HYSTERESIS = 12;                          // Гистерезис
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
 // ==========================================
+uint8_t calculateCRC8(const uint8_t* data, size_t len);
 void calibrateAmbientLight();
 bool isLightPresent();
+bool sampleBitWithVoting(uint32_t bitCenterUs);
 bool receiveByte(uint8_t& outByte);
-void processIncomingByte(char ch);
-void finalizeSentence();
+void processIncomingByte(uint8_t byteVal);
+void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC);
 void handleSerialCommands();
 
 // ==========================================
@@ -52,52 +61,69 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    Serial.println(F("\n======================================================="));
-    Serial.println(F("         >>> Li-Fi ПРИЕМНИК (RX) ЗАПУЩЕН <<<           "));
-    Serial.println(F("======================================================="));
-    Serial.print(F("[НАСТРОЙКА] Скорость: "));
+    Serial.println(F("\n============================================================"));
+    Serial.println(F("    >>> Li-Fi ПРИЕМНИК (RX) [С КОНТРОЛЕМ ОШИБОК CRC-8] <<<  "));
+    Serial.println(F("============================================================"));
+    Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
-    Serial.print(F("[НАСТРОЙКА] Пин фотодиода: A"));
-    Serial.println(RX_PIN - A0);
-    Serial.println(F("[НАСТРОЙКА] Режим: Тишина в покое. Вывод только при передаче."));
+    Serial.println(F("[INFO] Включена аппаратная проверка контрольной суммы CRC-8."));
+    Serial.println(F("[INFO] В темноте - тишина (спам отключен)."));
 
-    // Автоматическая калибровка при включении
+    // Автокалибровка порога под освещение
     calibrateAmbientLight();
 
-    Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Команды: 'c' - калибровка, '+' / '-' - подстройка порога, 'r' - замер"));
-    Serial.println(F("Готов к приему оптического сигнала...\n"));
+    Serial.println(F("------------------------------------------------------------"));
+    Serial.println(F("Команды: 'c' - перекалибровка, '+' / '-' - подстройка порога, 'r' - замер"));
+    Serial.println(F("Ожидание оптического сигнала...\n"));
 }
 
 // ==========================================
 // ГЛАВНЫЙ ЦИКЛ (LOOP)
 // ==========================================
 void loop() {
-    // 1. Проверка команд от пользователя из монитора порта
+    // 1. Проверка команд управления от пользователя
     handleSerialCommands();
 
-    // 2. Ожидание появления светового импульса (Start-бит)
+    // 2. Ожидание оптического старт-бита
     if (isLightPresent()) {
         uint8_t receivedByte = 0;
 
-        // Попытка приема байта с абсолютной микросекундной фазировкой
+        // Прием байта с 5-кратной мажоритарной фильтрацией
         if (receiveByte(receivedByte)) {
-            char ch = static_cast<char>(receivedByte);
-            processIncomingByte(ch);
+            processIncomingByte(receivedByte);
         }
     }
 
-    // 3. Завершение фразы по таймауту тишины
-    if (isReceivingPhrase && (millis() - lastCharTime > MESSAGE_TIMEOUT_MS)) {
-        finalizeSentence();
+    // 3. Завершение фразы по таймауту тишины (если CRC не пришел вовремя)
+    if (isReceivingMessage && (millis() - lastCharTime > MESSAGE_TIMEOUT_MS)) {
+        finalizeMessageWithCRC(false, 0);
     }
 }
 
 // ==========================================
-// АЛГОРИТМ ПРИЕМА (МИКРОСЕКУНДНАЯ ТОЧНОСТЬ)
+// РАСЧЕТ CRC-8 (Полином 0x07: x^8 + x^2 + x + 1)
+// ==========================================
+
+uint8_t calculateCRC8(const uint8_t* data, size_t len) {
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x80) {
+                crc = (crc << 1) ^ 0x07;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+// ==========================================
+// АЛГОРИТМ ПРИЕМА И 5-КРАТНАЯ ВЫБОРКА
 // ==========================================
 
 bool isLightPresent() {
@@ -105,86 +131,156 @@ bool isLightPresent() {
 }
 
 /**
- * @brief Прецизионный прием байта с абсолютной временной привязкой (Zero Cumulative Drift)
+ * @brief 5-кратное мажоритарное сэмплирование в центре бита
+ */
+bool sampleBitWithVoting(uint32_t bitCenterUs) {
+    int highVotes = 0;
+    constexpr int offsetsUs[5] = {-6000, -3000, 0, 3000, 6000};
+
+    for (int i = 0; i < 5; i++) {
+        uint32_t sampleTimeUs = bitCenterUs + offsetsUs[i];
+        while ((long)(micros() - sampleTimeUs) < 0);
+        
+        int val = analogRead(RX_PIN);
+        if (val >= (thresholdValue - HYSTERESIS)) {
+            highVotes++;
+        }
+    }
+
+    return (highVotes >= 3);
+}
+
+/**
+ * @brief Прецизионный прием байта с абсолютной микросекундной фазировкой
  */
 bool receiveByte(uint8_t& outByte) {
     uint32_t frameStartUs = micros();
 
-    // Шаг 1: Проверка центра стартового бита (+ 0.5 * T = 25 000 мкс)
-    while ((long)(micros() - (frameStartUs + (BIT_PERIOD_US / 2))) < 0) {
-        // Ожидание центра старт-бита
-    }
-    
+    // Шаг 1: Центр стартового бита (+ 0.5 * T)
+    uint32_t startCenterUs = frameStartUs + (BIT_PERIOD_US / 2);
+    while ((long)(micros() - startCenterUs) < 0);
+
     int startSample = analogRead(RX_PIN);
     if (startSample < (thresholdValue - HYSTERESIS)) {
-        return false; // Ложный шум / кратковременный блик
+        return false; // Ложный блик
     }
+
+    Serial.println(F("\n=================[ ПРИЕМ ОПТИЧЕСКОГО КАДРА ]================="));
+    Serial.print(F(">> [СТАРТ-БИТ] Подтвержден (АЦП: "));
+    Serial.print(startSample);
+    Serial.println(F(" >= Порога)"));
 
     uint8_t reconstructedByte = 0;
+    Serial.print(F(">> [БИТЫ 0..7 (5x)]: "));
 
-    // Шаг 2: Считывание 8 бит данных строго в абсолютных точках времени:
-    // Бит 0: frameStart + 1.5 * T
-    // Бит 1: frameStart + 2.5 * T ...
-    // Бит 7: frameStart + 8.5 * T
+    // Шаг 2: Считывание 8 бит с 5-кратной выборкой на каждом бите
     for (uint8_t bitIdx = 0; bitIdx < 8; bitIdx++) {
-        uint32_t targetUs = frameStartUs + (BIT_PERIOD_US * 3 / 2) + ((uint32_t)bitIdx * BIT_PERIOD_US);
-        
-        while ((long)(micros() - targetUs) < 0) {
-            // Точное ожидание центра бита без накопления ошибки
-        }
+        uint32_t bitCenterUs = frameStartUs + (BIT_PERIOD_US * 3 / 2) + ((uint32_t)bitIdx * BIT_PERIOD_US);
 
-        int bitAdc = analogRead(RX_PIN);
-        if (bitAdc >= (thresholdValue - HYSTERESIS)) {
+        bool bitVal = sampleBitWithVoting(bitCenterUs);
+
+        if (bitVal) {
             reconstructedByte |= (1 << bitIdx);
+            Serial.print(F("1 "));
+        } else {
+            Serial.print(F("0 "));
         }
     }
+    Serial.println();
 
-    // Шаг 3: Проверка стопового бита (frameStart + 9.5 * T)
-    uint32_t stopTargetUs = frameStartUs + (BIT_PERIOD_US * 19 / 2);
-    while ((long)(micros() - stopTargetUs) < 0) {
-        // Ожидание центра стоп-бита
-    }
+    // Шаг 3: Проверка стоп-бита (+ 9.5 * T)
+    uint32_t stopCenterUs = frameStartUs + (BIT_PERIOD_US * 19 / 2);
+    while ((long)(micros() - stopCenterUs) < 0);
 
     int stopAdc = analogRead(RX_PIN);
     bool isStopValid = (stopAdc < thresholdValue);
 
-    // Дожидаемся окончания стоп-бита (frameStart + 10.0 * T)
+    // Окончание стоп-бита (+ 10.0 * T)
     uint32_t frameEndUs = frameStartUs + (BIT_PERIOD_US * 10);
-    while ((long)(micros() - frameEndUs) < 0) {
-        // Ожидание конца кадра
-    }
+    while ((long)(micros() - frameEndUs) < 0);
 
     if (isStopValid) {
+        Serial.print(F(">> [СТОП-БИТ]   КОРРЕКТЕН (АЦП: "));
+        Serial.print(stopAdc);
+        Serial.println(F(" < Порога) -> OK!"));
         outByte = reconstructedByte;
         return true;
+    } else {
+        Serial.print(F(">> [СТОП-БИТ]   ОШИБКА! Стоп-бит = HIGH (АЦП: "));
+        Serial.print(stopAdc);
+        Serial.println(F(" >= Порога)"));
+        Serial.println(F("============================================================\n"));
+        return false;
     }
-
-    return false;
 }
 
 // ==========================================
-// ОБРАБОТКА СИМВОЛОВ И ЕДИНАЯ СТРОКА
+// ОБРАБОТКА СИМВОЛОВ И ПРОВЕРКА CRC-8
 // ==========================================
 
-void processIncomingByte(char ch) {
+void processIncomingByte(uint8_t byteVal) {
     lastCharTime = millis();
+    isReceivingMessage = true;
+    char ch = static_cast<char>(byteVal);
 
-    // Если это первый символ новой фразы — печатаем заголовок
-    if (!isReceivingPhrase) {
-        isReceivingPhrase = true;
-        Serial.print(F("[Li-Fi Прием]: "));
-    }
+    // Если ждем контрольный байт CRC-8
+    if (rxState == STATE_WAIT_CRC) {
+        Serial.println(F("------------------------------------------------------------"));
+        Serial.print(F(">>> [ПРИНЯТ БАЙТ CRC-8]: 0x"));
+        if (byteVal < 16) Serial.print(F("0"));
+        Serial.print(byteVal, HEX);
+        Serial.print(F(" (BIN: 0b"));
+        for (int i = 7; i >= 0; i--) Serial.print((byteVal >> i) & 1);
+        Serial.println(F(")"));
+        Serial.println(F("============================================================\n"));
 
-    // Обработка символа конца строки
-    if (ch == '\n' || ch == '\r') {
-        finalizeSentence();
+        finalizeMessageWithCRC(true, byteVal);
         return;
     }
 
-    // Добавляем символ (включая ПРОБЕЛ) в текущую строку и буфер
-    if (ch >= 32 && ch <= 126) {
-        Serial.print(ch); // Мгновенный вывод символа в консоль
+    // Вывод диагностической карточки принятого символа
+    Serial.println(F("------------------------------------------------------------"));
+    Serial.print(F(">>> ПРИНЯТ СИМВОЛ: "));
+    if (ch == ' ') {
+        Serial.print(F("[ПРОБЕЛ]"));
+    } else if (ch >= 'A' && ch <= 'Z') {
+        Serial.print(F("'"));
+        Serial.print(ch);
+        Serial.print(F("' (ЗАГЛАВНАЯ)"));
+    } else if (ch >= 'a' && ch <= 'z') {
+        Serial.print(F("'"));
+        Serial.print(ch);
+        Serial.print(F("' (строчная)"));
+    } else if (ch >= '0' && ch <= '9') {
+        Serial.print(F("'"));
+        Serial.print(ch);
+        Serial.print(F("' (цифра)"));
+    } else if (ch == '\n') {
+        Serial.print(F("[МАРКЕР ОКОНЧАНИЯ ТЕКСТА \\n]"));
+    } else {
+        Serial.print(F("'"));
+        Serial.print(ch);
+        Serial.print(F("'"));
+    }
+    
+    Serial.print(F(" | ASCII: "));
+    Serial.print((int)byteVal);
+    Serial.print(F(" | HEX: 0x"));
+    if (byteVal < 16) Serial.print(F("0"));
+    Serial.print(byteVal, HEX);
+    Serial.print(F(" | BIN: 0b"));
+    for (int i = 7; i >= 0; i--) Serial.print((byteVal >> i) & 1);
+    Serial.println();
+    Serial.println(F("============================================================\n"));
 
+    // Если пришел маркер окончания текста -> переключаемся в ожидание CRC-8
+    if (ch == '\n' || ch == '\r') {
+        rxState = STATE_WAIT_CRC;
+        return;
+    }
+
+    // Сохраняем символ полезной нагрузки
+    if (ch >= 32 && ch <= 126) {
         if (bufferIndex < BUFFER_SIZE - 1) {
             sentenceBuffer[bufferIndex++] = ch;
             sentenceBuffer[bufferIndex] = '\0';
@@ -193,21 +289,45 @@ void processIncomingByte(char ch) {
 }
 
 /**
- * @brief Окончание фразы и вывод итогового сообщения
+ * @brief Итоговая проверка контрольной суммы CRC-8 и вывод отчета
  */
-void finalizeSentence() {
-    if (!isReceivingPhrase && bufferIndex == 0) return;
+void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
+    isReceivingMessage = false;
+    rxState = STATE_PAYLOAD;
 
-    isReceivingPhrase = false;
-    Serial.println(); // Перевод строки после потока символов
+    if (bufferIndex == 0) return;
 
-    if (bufferIndex > 0) {
-        Serial.println(F("-------------------------------------------------------"));
-        Serial.print(F(">>> [ИТОГОВОЕ СООБЩЕНИЕ]: \""));
-        Serial.print(sentenceBuffer);
-        Serial.println(F("\""));
-        Serial.println(F("-------------------------------------------------------\n"));
+    // Рассчитываем контрольную сумму от полученных данных
+    uint8_t calculatedCRC = calculateCRC8(reinterpret_cast<const uint8_t*>(sentenceBuffer), bufferIndex);
+
+    Serial.println(F("************************************************************"));
+    Serial.print(F(">>> [ИТОГОВОЕ СООБЩЕНИЕ]: \""));
+    Serial.print(sentenceBuffer);
+    Serial.println(F("\""));
+    Serial.print(F(">>> [ДЛИНА СООБЩЕНИЯ]:   "));
+    Serial.print(bufferIndex);
+    Serial.println(F(" символов"));
+
+    if (hasCrc) {
+        Serial.print(F(">>> [КОНТРОЛЬ CRC-8]:     Расчетный = 0x"));
+        if (calculatedCRC < 16) Serial.print(F("0"));
+        Serial.print(calculatedCRC, HEX);
+        Serial.print(F(" | Принятый = 0x"));
+        if (receivedCRC < 16) Serial.print(F("0"));
+        Serial.println(receivedCRC, HEX);
+
+        if (calculatedCRC == receivedCRC) {
+            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]: [УСПЕШНО - ОШИБОК НЕТ!] ✔"));
+        } else {
+            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]: [ОШИБКА CRC! ДАННЫЕ ИСКАЖЕНЫ ПОМЕХОЙ] ❌"));
+        }
+    } else {
+        Serial.print(F(">>> [КОНТРОЛЬ CRC-8]:     Таймаут ожидания CRC (Расчетный: 0x"));
+        if (calculatedCRC < 16) Serial.print(F("0"));
+        Serial.print(calculatedCRC, HEX);
+        Serial.println(F(")"));
     }
+    Serial.println(F("************************************************************\n"));
 
     bufferIndex = 0;
     sentenceBuffer[0] = '\0';
@@ -219,9 +339,10 @@ void finalizeSentence() {
 
 void calibrateAmbientLight() {
     Serial.println(F("\n[КАЛИБРОВКА] Измерение фонового света..."));
+    Serial.println(F("[КАЛИБРОВКА] Убедитесь, что передающий LED выключен."));
 
     long sum = 0;
-    constexpr int SAMPLES = 80;
+    constexpr int SAMPLES = 100;
     int minVal = 1023;
     int maxVal = 0;
 
@@ -230,18 +351,18 @@ void calibrateAmbientLight() {
         sum += val;
         if (val < minVal) minVal = val;
         if (val > maxVal) maxVal = val;
-        delay(10);
+        delay(15);
     }
 
     ambientNoiseLevel = sum / SAMPLES;
     thresholdValue = max(ambientNoiseLevel + NOISE_MARGIN, maxVal + 15);
     thresholdValue = constrain(thresholdValue, 25, 950);
 
-    Serial.print(F("[КАЛИБРОВКА] Фон (темнота): "));
+    Serial.print(F("[КАЛИБРОВКА] Фон: "));
     Serial.print(ambientNoiseLevel);
-    Serial.print(F(", Пик шума: "));
+    Serial.print(F(", Пик: "));
     Serial.print(maxVal);
-    Serial.print(F(" -> Установлен порог: "));
+    Serial.print(F(" -> Порог (Threshold): "));
     Serial.print(thresholdValue);
     Serial.println(F(" (ADC 0..1023)\n"));
 }
@@ -253,19 +374,19 @@ void handleSerialCommands() {
             calibrateAmbientLight();
         } else if (cmd == '+') {
             thresholdValue = min(1000, thresholdValue + 15);
-            Serial.print(F("[РУЧНАЯ НАСТРОЙКА] Порог увеличен: "));
+            Serial.print(F("[НАСТРОЙКА] Порог увеличен: "));
             Serial.println(thresholdValue);
         } else if (cmd == '-') {
             thresholdValue = max(10, thresholdValue - 15);
-            Serial.print(F("[РУЧНАЯ НАСТРОЙКА] Порог уменьшен: "));
+            Serial.print(F("[НАСТРОЙКА] Порог уменьшен: "));
             Serial.println(thresholdValue);
         } else if (cmd == 'r' || cmd == 'R') {
             int cur = analogRead(RX_PIN);
-            Serial.print(F("[ТЕКУЩИЙ ЗАМЕР] АЦП = "));
+            Serial.print(F("[ЗАМЕР АЦП]: "));
             Serial.print(cur);
-            Serial.print(F(" / 1023 | Порог = "));
+            Serial.print(F(" / 1023 | Порог: "));
             Serial.print(thresholdValue);
-            Serial.println((cur >= thresholdValue) ? F(" [СВЕТ ВКЛЮЧЕН]") : F(" [ТЕМНОТА]"));
+            Serial.println((cur >= thresholdValue) ? F(" [СВЕТ ОБНАРУЖЕН]") : F(" [ТЕМНОТА]"));
         }
     }
 }
