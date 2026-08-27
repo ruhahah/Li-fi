@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПРИЕМНИК (RX) - С ПРОВЕРКОЙ ЦЕЛОСТНОСТИ ДАННЫХ CRC-8
+ * МОДУЛЬ: ПРИЕМНИК (RX) - СКОРОСТНОЙ РЕЖИМ (50 БОД) + CRC-8 + ДИНАМИЧЕСКИЙ 5X
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор 10 кОм -> GND)
  * ============================================================================
@@ -10,19 +10,19 @@
 #include <Arduino.h>
 
 // ==========================================
-// КОНФИГУРАЦИЯ И НАСТРОЙКИ
+// КОНФИГУРАЦИЯ И НАСТРОЙКИ СКОРОСТИ
 // ==========================================
 constexpr uint8_t RX_PIN = A0;                         // Аналоговый вход фотодиода
-constexpr uint16_t BAUD_RATE = 20;                     // Скорость передачи: 20 бит/с
-constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // Длительность одного бита: 50 000 мкс (50 мс)
+constexpr uint16_t BAUD_RATE = 50;                     // Увеличенная скорость: 50 бит/с (было 20)
+constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // Длительность одного бита: 20 000 мкс (20 мс)
 
 // Буфер для сборки предложения
 constexpr size_t BUFFER_SIZE = 256;
 char sentenceBuffer[BUFFER_SIZE];
 size_t bufferIndex = 0;
 
-// Таймаут тишины (окончание всей фразы): 800 мс
-constexpr uint32_t MESSAGE_TIMEOUT_MS = 800;
+// Таймаут тишины (окончание всей фразы): 350 мс (быстрое завершение)
+constexpr uint32_t MESSAGE_TIMEOUT_MS = 350;
 uint32_t lastCharTime = 0;
 bool isReceivingMessage = false;
 
@@ -36,8 +36,8 @@ RxPacketState rxState = STATE_PAYLOAD;
 // Порог срабатывания и параметры калибровки
 int ambientNoiseLevel = 0;                              // Базовый уровень шума (темнота)
 int thresholdValue = 60;                               // Порог переключения (ADC 0..1023)
-constexpr int NOISE_MARGIN = 40;                        // Запас над шумом
-constexpr int HYSTERESIS = 12;                          // Гистерезис
+constexpr int NOISE_MARGIN = 35;                        // Запас над шумом
+constexpr int HYSTERESIS = 10;                          // Гистерезис
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
@@ -62,14 +62,14 @@ void setup() {
     delay(500);
 
     Serial.println(F("\n============================================================"));
-    Serial.println(F("    >>> Li-Fi ПРИЕМНИК (RX) [С КОНТРОЛЕМ ОШИБОК CRC-8] <<<  "));
+    Serial.println(F("    >>> Li-Fi ПРИЕМНИК (RX) [TURBO 50 BAUD + CRC-8] <<<     "));
     Serial.println(F("============================================================"));
     Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
-    Serial.println(F(" мс"));
-    Serial.println(F("[INFO] Включена аппаратная проверка контрольной суммы CRC-8."));
+    Serial.println(F(" мс (Ускорено в 2.5 раза!)"));
+    Serial.println(F("[INFO] Динамическое 5-кратное сэмплирование центра бита."));
     Serial.println(F("[INFO] В темноте - тишина (спам отключен)."));
 
     // Автокалибровка порога под освещение
@@ -104,7 +104,7 @@ void loop() {
 }
 
 // ==========================================
-// РАСЧЕТ CRC-8 (Полином 0x07: x^8 + x^2 + x + 1)
+// РАСЧЕТ CRC-8
 // ==========================================
 
 uint8_t calculateCRC8(const uint8_t* data, size_t len) {
@@ -131,11 +131,15 @@ bool isLightPresent() {
 }
 
 /**
- * @brief 5-кратное мажоритарное сэмплирование в центре бита
+ * @brief 5-кратное сэмплирование вокруг центра бита
+ * Интервалы автоматически масштабируются под выбранную скорость (BAUD_RATE)
  */
 bool sampleBitWithVoting(uint32_t bitCenterUs) {
     int highVotes = 0;
-    constexpr int offsetsUs[5] = {-6000, -3000, 0, 3000, 6000};
+    
+    // Шаг между сэмплами: 1/16 от длительности бита (для 20 мс -> 1250 мкс)
+    const int32_t stepUs = (int32_t)(BIT_PERIOD_US / 16);
+    const int32_t offsetsUs[5] = {-2 * stepUs, -stepUs, 0, stepUs, 2 * stepUs};
 
     for (int i = 0; i < 5; i++) {
         uint32_t sampleTimeUs = bitCenterUs + offsetsUs[i];
@@ -229,9 +233,7 @@ void processIncomingByte(uint8_t byteVal) {
         Serial.print(F(">>> [ПРИНЯТ БАЙТ CRC-8]: 0x"));
         if (byteVal < 16) Serial.print(F("0"));
         Serial.print(byteVal, HEX);
-        Serial.print(F(" (BIN: 0b"));
-        for (int i = 7; i >= 0; i--) Serial.print((byteVal >> i) & 1);
-        Serial.println(F(")"));
+        Serial.println(F(" (Контроль целостности)"));
         Serial.println(F("============================================================\n"));
 
         finalizeMessageWithCRC(true, byteVal);
@@ -297,7 +299,6 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
 
     if (bufferIndex == 0) return;
 
-    // Рассчитываем контрольную сумму от полученных данных
     uint8_t calculatedCRC = calculateCRC8(reinterpret_cast<const uint8_t*>(sentenceBuffer), bufferIndex);
 
     Serial.println(F("************************************************************"));
@@ -342,7 +343,7 @@ void calibrateAmbientLight() {
     Serial.println(F("[КАЛИБРОВКА] Убедитесь, что передающий LED выключен."));
 
     long sum = 0;
-    constexpr int SAMPLES = 100;
+    constexpr int SAMPLES = 80;
     int minVal = 1023;
     int maxVal = 0;
 
@@ -351,7 +352,7 @@ void calibrateAmbientLight() {
         sum += val;
         if (val < minVal) minVal = val;
         if (val > maxVal) maxVal = val;
-        delay(15);
+        delay(12);
     }
 
     ambientNoiseLevel = sum / SAMPLES;
