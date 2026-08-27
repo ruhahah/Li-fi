@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПРИЕМНИК (RX) - МАНЧЕСТЕР 25 БОД + ДИНАМИЧЕСКИЙ ФОН + ТЕЛЕМЕТРИЯ
+ * МОДУЛЬ: ПРИЕМНИК (RX) - АВТОАДАПТАЦИЯ + КИРИЛЛИЦА + CRC-8 + ТЕЛЕМЕТРИЯ SNR
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор -> GND)
  * ============================================================================
@@ -13,9 +13,8 @@
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ СКОРОСТИ
 // ==========================================
 constexpr uint8_t RX_PIN = A0;                         // Аналоговый вход фотодиода
-constexpr uint16_t BAUD_RATE = 25;                     // Скорость: 25 бит/с
-constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 40 000 мкс (40 мс)
-constexpr uint32_t HALF_PERIOD_US = BIT_PERIOD_US / 2;     // 20 000 мкс (20 мс)
+constexpr uint16_t BAUD_RATE = 30;                     // Скорость: 30 бит/с (33.3 мс)
+constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
 
 // Буфер для сборки UTF-8 текста любой длины
 constexpr size_t BUFFER_SIZE = 512;
@@ -35,24 +34,24 @@ enum RxPacketState {
 };
 RxPacketState rxState = STATE_PAYLOAD;
 
-// Параметры адаптивного порога
-int ambientNoiseLevel = 50;                             // Текущий уровень фонового света
-int thresholdValue = 80;                               // Автоматический порог
-int peakLightAdc = 200;                                // Замеренный пик света
-uint32_t lastBaselineUpdate = 0;
+// Динамические параметры адаптивного порога и телеметрии
+int ambientNoiseLevel = 3;                              // Уровень темноты
+int thresholdValue = 35;                               // Автоматический адаптивный порог
+int peakLightAdc = 150;                                // Замеренный пик света
+int hysteresisVal = 8;                                 // Гистерезис
 
-// Статистика
+// Накопление средней яркости для точного расчета SNR
 long totalLightAdcSum = 0;
 int lightSamplesCount = 0;
-int manchesterErrorCount = 0;
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
 // ==========================================
 uint8_t calculateCRC8(const uint8_t* data, size_t len);
-void updateAmbientBaseline();
+void calibrateDarkness();
 bool checkStartTrigger();
-bool receiveByteManchester(uint8_t& outByte);
+bool sampleBitWithVoting(uint32_t bitCenterUs);
+bool receiveByte(uint8_t& outByte);
 void processIncomingByte(uint8_t byteVal);
 void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC);
 void handleSerialCommands();
@@ -66,28 +65,19 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Первоначальный замер фона
-    long sum = 0;
-    for (int i = 0; i < 30; i++) {
-        sum += analogRead(RX_PIN);
-        delay(5);
-    }
-    ambientNoiseLevel = sum / 30;
-    thresholdValue = ambientNoiseLevel + 30;
-
     Serial.println(F("\n============================================================"));
-    Serial.println(F("  >>> Li-Fi ПРИЕМНИК (RX) [МАНЧЕСТЕР 25 БОД + AUTO-TRACK] <<<"));
+    Serial.println(F("  >>> Li-Fi ПРИЕМНИК (RX) [ТЕЛЕМЕТРИЯ SNR + UTF-8 + CRC] <<<"));
     Serial.println(F("============================================================"));
     Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
-    Serial.print(F(" мс (Полутакты: "));
-    Serial.print(HALF_PERIOD_US / 1000);
-    Serial.println(F(" мс)"));
-    Serial.print(F("[INFO] Текущий фоновый свет комнаты: "));
-    Serial.print(ambientNoiseLevel);
-    Serial.println(F(" ADC (Непрерывное отслеживание)."));
+    Serial.println(F(" мс"));
+    Serial.println(F("[INFO] Включен расчет оптического контраста, SNR (дБ) и скорости."));
+
+    // Замеряем базовый уровень темноты
+    calibrateDarkness();
+
     Serial.println(F("------------------------------------------------------------"));
     Serial.println(F("Приемник готов к работе...\n"));
 }
@@ -98,16 +88,11 @@ void setup() {
 void loop() {
     handleSerialCommands();
 
-    // Непрерывное динамическое отслеживание освещения комнаты в покое
-    if (!isReceivingMessage) {
-        updateAmbientBaseline();
-    }
-
-    // Проверка появления оптического синхро-импульса
+    // Проверка появления оптического импульса (триггер старт-бита)
     if (checkStartTrigger()) {
         uint8_t receivedByte = 0;
 
-        if (receiveByteManchester(receivedByte)) {
+        if (receiveByte(receivedByte)) {
             processIncomingByte(receivedByte);
         }
     }
@@ -116,26 +101,6 @@ void loop() {
     if (isReceivingMessage && (millis() - lastCharTime > MESSAGE_TIMEOUT_MS)) {
         finalizeMessageWithCRC(false, 0);
     }
-}
-
-// ==========================================
-// ДИНАМИЧЕСКИЙ ФОНОВЫЙ СВЕТ
-// ==========================================
-
-void updateAmbientBaseline() {
-    if (millis() - lastBaselineUpdate >= 100) {
-        lastBaselineUpdate = millis();
-        int cur = analogRead(RX_PIN);
-        // Экспоненциальное скользящее среднее (адаптация к люстрам и солнцу)
-        ambientNoiseLevel = (ambientNoiseLevel * 3 + cur) / 4;
-        thresholdValue = ambientNoiseLevel + 25;
-    }
-}
-
-bool checkStartTrigger() {
-    int val = analogRead(RX_PIN);
-    // Срабатывает только при скачке света ВЫШЕ текущего освещения комнаты
-    return (val > (ambientNoiseLevel + 20));
 }
 
 // ==========================================
@@ -158,69 +123,84 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 }
 
 // ==========================================
-// МАНЧЕСТЕРСКИЙ ПРИЕМ (20 мс полутакты)
+// АВТОАДАПТИВНЫЙ ПРИЕМ
 // ==========================================
 
-bool receiveByteManchester(uint8_t& outByte) {
-    uint32_t frameStartUs = micros();
+bool checkStartTrigger() {
+    int val = analogRead(RX_PIN);
+    return (val > (ambientNoiseLevel + 12));
+}
 
-    // 1. СИНХРО-БИТ (Манчестер '1' = HIGH -> LOW):
-    // Замеряем пик света в середине 1-й половины (10 мс)
-    uint32_t syncMid1Us = frameStartUs + (HALF_PERIOD_US / 2);
-    while ((long)(micros() - syncMid1Us) < 0);
+bool sampleBitWithVoting(uint32_t bitCenterUs) {
+    int highVotes = 0;
+    constexpr int32_t offsetsUs[3] = {-2000, 0, 2000};
 
-    int startSample = analogRead(RX_PIN);
-    if (startSample <= (ambientNoiseLevel + 15)) {
-        return false; // Ложный блик
-    }
-
-    // ИДЕАЛЬНЫЙ ПОРОГ: строго середина между текущим фоном и реальным лучом
-    peakLightAdc = startSample;
-    thresholdValue = (ambientNoiseLevel + peakLightAdc) / 2;
-
-    totalLightAdcSum += peakLightAdc;
-    lightSamplesCount++;
-
-    // Дожидаемся окончания синхро-бита (+ 40 мс)
-    uint32_t syncEndUs = frameStartUs + BIT_PERIOD_US;
-    while ((long)(micros() - syncEndUs) < 0);
-
-    uint8_t reconstructedByte = 0;
-
-    // 2. ДЕКОДИРОВАНИЕ 8 МАНЧЕСТЕР-БИТОВ
-    for (uint8_t bitIdx = 0; bitIdx < 8; bitIdx++) {
-        uint32_t bitStartUs = syncEndUs + ((uint32_t)bitIdx * BIT_PERIOD_US);
-
-        // Замер в центре 1-й половины бита (10 мс от начала бита)
-        uint32_t sample1Us = bitStartUs + (HALF_PERIOD_US / 2);
-        while ((long)(micros() - sample1Us) < 0);
-        int val1 = analogRead(RX_PIN);
-        bool firstHalfHigh = (val1 >= thresholdValue);
-
-        // Замер в центре 2-й половины бита (30 мс от начала бита)
-        uint32_t sample2Us = bitStartUs + HALF_PERIOD_US + (HALF_PERIOD_US / 2);
-        while ((long)(micros() - sample2Us) < 0);
-        int val2 = analogRead(RX_PIN);
-        bool secondHalfHigh = (val2 >= thresholdValue);
-
-        // Правило Манчестера:
-        if (firstHalfHigh && !secondHalfHigh) {
-            // HIGH -> LOW = Бит 1
-            reconstructedByte |= (1 << bitIdx);
-        } else if (!firstHalfHigh && secondHalfHigh) {
-            // LOW -> HIGH = Бит 0
-        } else {
-            // Ошибка формы Манчестера
-            manchesterErrorCount++;
+    for (int i = 0; i < 3; i++) {
+        uint32_t sampleTimeUs = bitCenterUs + offsetsUs[i];
+        while ((long)(micros() - sampleTimeUs) < 0);
+        
+        int val = analogRead(RX_PIN);
+        if (val >= thresholdValue) {
+            highVotes++;
         }
     }
 
-    // Завершение кадра
-    uint32_t frameEndUs = syncEndUs + (8UL * BIT_PERIOD_US);
+    return (highVotes >= 2);
+}
+
+/**
+ * @brief Прием байта с автоматической динамической подстройкой порога
+ */
+bool receiveByte(uint8_t& outByte) {
+    uint32_t frameStartUs = micros();
+
+    // 1. Центр стартового бита (+ 0.5 * T = 16.6 мс)
+    uint32_t startCenterUs = frameStartUs + (BIT_PERIOD_US / 2);
+    while ((long)(micros() - startCenterUs) < 0);
+
+    int startSample = analogRead(RX_PIN);
+    if (startSample <= (ambientNoiseLevel + 15)) {
+        return false; // Ложный шум
+    }
+
+    // ДИНАМИЧЕСКИЙ РАСЧЕТ ПОРОГА
+    peakLightAdc = startSample;
+    thresholdValue = (ambientNoiseLevel + peakLightAdc) / 2;
+    hysteresisVal = max(4, (peakLightAdc - ambientNoiseLevel) / 10);
+
+    // Сбор статистики для SNR
+    totalLightAdcSum += peakLightAdc;
+    lightSamplesCount++;
+
+    uint8_t reconstructedByte = 0;
+
+    // 2. Считывание 8 бит
+    for (uint8_t bitIdx = 0; bitIdx < 8; bitIdx++) {
+        uint32_t bitCenterUs = frameStartUs + (BIT_PERIOD_US * 3 / 2) + ((uint32_t)bitIdx * BIT_PERIOD_US);
+
+        bool bitVal = sampleBitWithVoting(bitCenterUs);
+        if (bitVal) {
+            reconstructedByte |= (1 << bitIdx);
+        }
+    }
+
+    // 3. Проверка стоп-бита (+ 9.5 * T)
+    uint32_t stopCenterUs = frameStartUs + (BIT_PERIOD_US * 19 / 2);
+    while ((long)(micros() - stopCenterUs) < 0);
+
+    int stopAdc = analogRead(RX_PIN);
+    bool isStopValid = (stopAdc < thresholdValue);
+
+    // Окончание кадра (+ 10.0 * T)
+    uint32_t frameEndUs = frameStartUs + (BIT_PERIOD_US * 10);
     while ((long)(micros() - frameEndUs) < 0);
 
-    outByte = reconstructedByte;
-    return true;
+    if (isStopValid) {
+        outByte = reconstructedByte;
+        return true;
+    }
+
+    return false;
 }
 
 // ==========================================
@@ -233,7 +213,6 @@ void processIncomingByte(uint8_t byteVal) {
         messageStartTime = millis();
         totalLightAdcSum = 0;
         lightSamplesCount = 0;
-        manchesterErrorCount = 0;
     }
     lastCharTime = millis();
 
@@ -261,7 +240,7 @@ void processIncomingByte(uint8_t byteVal) {
 }
 
 /**
- * @brief Итоговый отчет: Сообщение + CRC-8 + Телеметрия
+ * @brief Итоговый отчет: Сообщение + CRC-8 + Полная метрика качества канала Li-Fi
  */
 void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
     isReceivingMessage = false;
@@ -270,18 +249,19 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
     if (bufferIndex == 0) return;
 
     // Расчет времени передачи
-    uint32_t totalDurationMs = lastCharTime - messageStartTime + 300;
-    if (totalDurationMs < 50) totalDurationMs = 50;
+    uint32_t totalDurationMs = lastCharTime - messageStartTime + 350;
+    if (totalDurationMs < 100) totalDurationMs = 100;
     float durationSec = totalDurationMs / 1000.0;
 
     // Расчет скорости
     float bytesPerSec = (float)bufferIndex / durationSec;
     float bitsPerSec = bytesPerSec * 8.0;
 
-    // Расчет контраста и SNR
+    // Расчет средней яркости луча и оптического контраста
     int avgLightAdc = (lightSamplesCount > 0) ? (int)(totalLightAdcSum / lightSamplesCount) : peakLightAdc;
     int contrastDelta = avgLightAdc - ambientNoiseLevel;
 
+    // Расчет отношения Сигнал/Шум (SNR в дБ)
     float snrDb = 0.0;
     int noiseBase = max(1, ambientNoiseLevel);
     if (avgLightAdc > noiseBase) {
@@ -320,9 +300,9 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
         Serial.println(F(")"));
     }
 
-    // МАНЧЕСТЕРСКАЯ ТЕЛЕМЕТРИЯ
+    // ВЫВОД ТЕЛЕМЕТРИИ КАНАЛА
     Serial.println(F("------------------------------------------------------------"));
-    Serial.println(F(">>> [МЕТРИКИ ОПТИЧЕСКОГО КАНАЛА (МАНЧЕСТЕР IEEE 802.15.7)]:"));
+    Serial.println(F(">>> [МЕТРИКИ ОПТИЧЕСКОГО КАНАЛА LI-FI]:"));
     Serial.print(F("    • Оптический контраст (ΔV): "));
     Serial.print(contrastDelta);
     Serial.print(F(" ADC (Луч: "));
@@ -334,25 +314,23 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
     Serial.print(F("    • SNR (Отношение Сигнал/Шум): "));
     Serial.print(snrDb, 1);
     Serial.print(F(" dB "));
-    if (snrDb >= 20.0) {
+    if (snrDb >= 25.0) {
         Serial.println(F("[ОТЛИЧНЫЙ СИГНАЛ] ★★★"));
-    } else if (snrDb >= 10.0) {
+    } else if (snrDb >= 16.0) {
         Serial.println(F("[ХОРОШИЙ СИГНАЛ] ★★☆"));
-    } else {
+    } else if (snrDb >= 8.0) {
         Serial.println(F("[УДОВЛЕТВОРИТЕЛЬНО] ★☆☆"));
+    } else {
+        Serial.println(F("[СЛАБЫЙ СИГНАЛ / ШУМ] ☆☆☆"));
     }
 
-    Serial.print(F("    • Ошибки Манчестер-кода:     "));
-    Serial.print(manchesterErrorCount);
-    Serial.println((manchesterErrorCount == 0) ? F(" (Идеально) ✔") : F(" (Сбои формы) ⚠"));
-
-    Serial.print(F("    • Скорость передачи данных:  "));
+    Serial.print(F("    • Полезная скорость передачи: "));
     Serial.print(bytesPerSec, 1);
     Serial.print(F(" байт/с ("));
     Serial.print(bitsPerSec, 1);
     Serial.println(F(" бит/с)"));
 
-    Serial.print(F("    • Время передачи сообщения:  "));
+    Serial.print(F("    • Время передачи сообщения:   "));
     Serial.print(durationSec, 1);
     Serial.println(F(" сек"));
     Serial.println(F("************************************************************\n"));
@@ -362,17 +340,39 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
 }
 
 // ==========================================
-// КОМАНДЫ SERIAL
+// КАЛИБРОВКА ТЕМНОТЫ И КОМАНДЫ
 // ==========================================
+
+void calibrateDarkness() {
+    long sum = 0;
+    constexpr int SAMPLES = 60;
+    int maxVal = 0;
+
+    for (int i = 0; i < SAMPLES; i++) {
+        int val = analogRead(RX_PIN);
+        sum += val;
+        if (val > maxVal) maxVal = val;
+        delay(10);
+    }
+
+    ambientNoiseLevel = sum / SAMPLES;
+    thresholdValue = ambientNoiseLevel + 25;
+
+    Serial.print(F("[КАЛИБРОВКА] Фоновая темнота: "));
+    Serial.print(ambientNoiseLevel);
+    Serial.println(F(" (ADC 0..1023)\n"));
+}
 
 void handleSerialCommands() {
     if (Serial.available() > 0) {
         char cmd = Serial.read();
-        if (cmd == 'r' || cmd == 'R') {
+        if (cmd == 'c' || cmd == 'C') {
+            calibrateDarkness();
+        } else if (cmd == 'r' || cmd == 'R') {
             int cur = analogRead(RX_PIN);
             Serial.print(F("[АЦП]: "));
             Serial.print(cur);
-            Serial.print(F(" | Текущий фон: "));
+            Serial.print(F(" | Фон: "));
             Serial.print(ambientNoiseLevel);
             Serial.print(F(" | Порог: "));
             Serial.println(thresholdValue);

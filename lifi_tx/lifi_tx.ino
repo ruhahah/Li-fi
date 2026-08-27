@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - СТАБИЛЬНЫЙ МАНЧЕСТЕР 25 БОД (IEEE 802.15.7) + CRC
+ * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - ПОЛНАЯ ПОДДЕРЖКА КИРИЛЛИЦЫ (UTF-8) + CRC-8
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * СВЕТОДИОД: Модуль LED на Pin 13
  * ============================================================================
@@ -13,20 +13,18 @@
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ СКОРОСТИ
 // ==========================================
 constexpr uint8_t TX_PIN = 13;                         // Цифровой пин управления LED
-constexpr uint16_t BAUD_RATE = 25;                     // Оптимальная скорость: 25 бит/с
-constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 40 000 мкс (40 мс)
-constexpr uint32_t HALF_PERIOD_US = BIT_PERIOD_US / 2;     // 20 000 мкс (20 мс на полупериод)
+constexpr uint16_t BAUD_RATE = 30;                     // Скорость: 30 бит/с (33.3 мс на бит)
+constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
 
-// Межсимвольная защитная пауза (40 мс темноты)
+// Межсимвольная защитная пауза
 constexpr uint32_t INTER_BYTE_DELAY_US = BIT_PERIOD_US;
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
 // ==========================================
 uint8_t calculateCRC8(const uint8_t* data, size_t len);
-void sendManchesterBit(bool bitVal);
-void sendByteManchester(uint8_t data);
-void sendStringManchester(const char* str);
+void sendByte(uint8_t data);
+void sendString(const char* str);
 
 // ==========================================
 // SETUP
@@ -39,19 +37,17 @@ void setup() {
     delay(500);
 
     Serial.println(F("\n======================================================="));
-    Serial.println(F("  >>> Li-Fi ПЕРЕДАТЧИК (TX) [МАНЧЕСТЕР IEEE 802.15.7] <<< "));
+    Serial.println(F("     >>> Li-Fi ПЕРЕДАТЧИК (TX) [РУССКИЙ + ENGLISH] <<< "));
     Serial.println(F("======================================================="));
     Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
-    Serial.print(F(" мс (Полутакт: "));
-    Serial.print(HALF_PERIOD_US / 1000);
-    Serial.println(F(" мс)"));
-    Serial.println(F("[INFO] Кодирование: МАНЧЕСТЕР (Без мерцания света)."));
-    Serial.println(F("[INFO] Поддержка: РУССКИЙ (UTF-8) и ENGLISH + CRC-8."));
+    Serial.println(F(" мс"));
+    Serial.println(F("[INFO] Поддержка языков: РУССКИЙ (UTF-8) и ENGLISH."));
+    Serial.println(F("[INFO] Контроль целостности: CRC-8."));
     Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Введите сообщение и нажмите Enter:\n"));
+    Serial.println(F("Введите фразу на русском или английском и нажмите Enter:\n"));
 }
 
 // ==========================================
@@ -63,9 +59,10 @@ void loop() {
         input.trim();
         
         if (input.length() > 0) {
+            // Расчет контрольной суммы от UTF-8 байтов
             uint8_t crc = calculateCRC8(reinterpret_cast<const uint8_t*>(input.c_str()), input.length());
 
-            Serial.println(F("\n>>>>>>>>>>>>>> [ МАНЧЕСТЕР ПЕРЕДАЧА ] >>>>>>>>>>>>>>"));
+            Serial.println(F("\n>>>>>>>>>>>>>> [ НАЧАЛО ПЕРЕДАЧИ ] >>>>>>>>>>>>>>"));
             Serial.print(F("[TX] Сообщение: \""));
             Serial.print(input);
             Serial.println(F("\""));
@@ -77,14 +74,14 @@ void loop() {
             Serial.println();
             Serial.println(F("-------------------------------------------------"));
             
-            // 1. Передача текста
-            sendStringManchester(input.c_str());
+            // 1. Передача всех байтов строки (включая русские UTF-8 символы)
+            sendString(input.c_str());
             
             // 2. Маркер окончания текста
-            sendByteManchester('\n');
+            sendByte('\n');
             
             // 3. Байт контрольной суммы CRC-8
-            sendByteManchester(crc);
+            sendByte(crc);
             
             Serial.println(F("-------------------------------------------------"));
             Serial.println(F("<<<<<<<<<<<<<< [ ПЕРЕДАЧА ЗАВЕРШЕНА ] <<<<<<<<<<<<<<\n"));
@@ -112,40 +109,38 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 }
 
 // ==========================================
-// МАНЧЕСТЕРСКАЯ ПЕРЕДАЧА
+// ПЕРЕДАЧА ПО ЛУЧУ
 // ==========================================
 
-void sendManchesterBit(bool bitVal) {
-    uint32_t startUs = micros();
+void sendByte(uint8_t data) {
+    uint32_t frameStartUs = micros();
 
-    // 1-я половина бита
-    digitalWrite(TX_PIN, bitVal ? HIGH : LOW);
-    while ((long)(micros() - (startUs + HALF_PERIOD_US)) < 0);
-
-    // 2-я половина бита (инверсия)
-    digitalWrite(TX_PIN, bitVal ? LOW : HIGH);
-    while ((long)(micros() - (startUs + BIT_PERIOD_US)) < 0);
-}
-
-void sendByteManchester(uint8_t data) {
-    // 1. СИНХРО-БИТ (Манчестер '1' = HIGH -> LOW)
-    sendManchesterBit(true);
+    // 1. СТАРТОВЫЙ БИТ (HIGH)
+    digitalWrite(TX_PIN, HIGH);
+    while ((long)(micros() - (frameStartUs + BIT_PERIOD_US)) < 0);
 
     // 2. 8 БИТ ДАННЫХ (LSB first)
     for (uint8_t i = 0; i < 8; i++) {
         bool bit = (data >> i) & 0x01;
-        sendManchesterBit(bit);
+        digitalWrite(TX_PIN, bit ? HIGH : LOW);
+        
+        uint32_t targetUs = frameStartUs + ((uint32_t)(i + 2) * BIT_PERIOD_US);
+        while ((long)(micros() - targetUs) < 0);
     }
 
-    // 3. Линия в покой (LOW) и межсимвольная пауза
+    // 3. СТОПОВЫЙ БИТ (LOW)
     digitalWrite(TX_PIN, LOW);
-    uint32_t guardStartUs = micros();
-    while ((long)(micros() - (guardStartUs + INTER_BYTE_DELAY_US)) < 0);
+    uint32_t stopTargetUs = frameStartUs + (10UL * BIT_PERIOD_US);
+    while ((long)(micros() - stopTargetUs) < 0);
+
+    // 4. МЕЖСИМВОЛЬНАЯ ЗАЩИТНАЯ ПАУЗА (LOW)
+    uint32_t guardTargetUs = stopTargetUs + INTER_BYTE_DELAY_US;
+    while ((long)(micros() - guardTargetUs) < 0);
 }
 
-void sendStringManchester(const char* str) {
+void sendString(const char* str) {
     while (*str) {
-        sendByteManchester(static_cast<uint8_t>(*str));
+        sendByte(static_cast<uint8_t>(*str));
         str++;
     }
 }
