@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПРИЕМНИК (RX) - ПОДДЕРЖКА ПРОБЕЛОВ И МНОГОСЛОВНЫХ ПРЕДЛОЖЕНИЙ
+ * МОДУЛЬ: ПРИЕМНИК (RX) - МИКРОСЕКУНДНАЯ СИНХРОНИЗАЦИЯ И ЕДИНАЯ СТРОКА
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор 10 кОм -> GND)
  * ============================================================================
@@ -12,30 +12,25 @@
 // ==========================================
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ
 // ==========================================
-constexpr uint8_t RX_PIN = A0;                        // Аналоговый вход фотодиода
-constexpr uint16_t BAUD_RATE = 20;                    // Скорость передачи: 20 бит/с
-constexpr uint32_t BIT_PERIOD_MS = 1000 / BAUD_RATE;  // Длительность одного бита: 50 мс
+constexpr uint8_t RX_PIN = A0;                         // Аналоговый вход фотодиода
+constexpr uint16_t BAUD_RATE = 20;                     // Скорость: 20 бит/с
+constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // Длительность одного бита: 50 000 мкс (50 мс)
 
-// Буфер для сборки предложений и фраз с пробелами
+// Буфер для сборки предложений любой длины с пробелами
 constexpr size_t BUFFER_SIZE = 256;
-char messageBuffer[BUFFER_SIZE];
+char sentenceBuffer[BUFFER_SIZE];
 size_t bufferIndex = 0;
 
-// Таймаут тишины (окончание всей передачи / полная остановка)
-constexpr uint32_t MESSAGE_FLUSH_TIMEOUT_MS = 600;    // 600 мс тишины = фраза завершена
+// Таймаут тишины: 650 мс без новых импульсов = фраза полностью завершена
+constexpr uint32_t MESSAGE_TIMEOUT_MS = 650;
 uint32_t lastCharTime = 0;
-bool isReceivingMessage = false;
+bool isReceivingPhrase = false;
 
-// Параметры порога и калибровки
-int ambientNoiseLevel = 0;                             // Базовый фоновый шум
-int thresholdValue = 200;                              // Порог переключения (ADC 0..1023)
-constexpr int NOISE_MARGIN = 50;                       // Запас над шумом
-constexpr int HYSTERESIS = 15;                         // Гистерезис
-
-// Таймер статусного отчета (Heartbeat) - 1 раз в 3 секунды
-uint32_t lastTelemetryTime = 0;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 3000;       // 3 секунды
-bool liveStreamEnabled = true;
+// Порог срабатывания и калибровка
+int ambientNoiseLevel = 0;                              // Фоновый уровень темноты
+int thresholdValue = 60;                               // Порог переключения (ADC 0..1023)
+constexpr int NOISE_MARGIN = 40;                        // Запас над шумом
+constexpr int HYSTERESIS = 12;                          // Гистерезис
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
@@ -44,9 +39,8 @@ void calibrateAmbientLight();
 bool isLightPresent();
 bool receiveByte(uint8_t& outByte);
 void processIncomingByte(char ch);
-void flushMessageBuffer();
+void finalizeSentence();
 void handleSerialCommands();
-void printTelemetryReport();
 
 // ==========================================
 // SETUP
@@ -54,60 +48,56 @@ void printTelemetryReport();
 void setup() {
     pinMode(RX_PIN, INPUT);
 
-    // Скорость Serial 115200 бод для мгновенного вывода без задержек
+    // Запуск Serial Monitor на 115200 бод
     Serial.begin(115200);
     delay(500);
 
     Serial.println(F("\n======================================================="));
-    Serial.println(F("    >>> Li-Fi ПРИЕМНИК (RX) - ПРИЕМ ФРАЗ И ПРЕДЛОЖЕНИЙ <<<  "));
+    Serial.println(F("         >>> Li-Fi ПРИЕМНИК (RX) ЗАПУЩЕН <<<           "));
     Serial.println(F("======================================================="));
-    Serial.print(F("[INFO] Скорость Li-Fi: "));
+    Serial.print(F("[НАСТРОЙКА] Скорость: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
-    Serial.print(BIT_PERIOD_MS);
+    Serial.print(BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
-    Serial.println(F("[INFO] Пробелы сохраняются внутри фразы."));
-    Serial.println(F("[INFO] Завершение фразы: символ '\\n' или пауза 600 мс."));
+    Serial.print(F("[НАСТРОЙКА] Пин фотодиода: A"));
+    Serial.println(RX_PIN - A0);
+    Serial.println(F("[НАСТРОЙКА] Режим: Тишина в покое. Вывод только при передаче."));
 
-    // Калибровка под освещение
+    // Автоматическая калибровка при включении
     calibrateAmbientLight();
 
     Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Команды: 'c' - калибровка, '+' / '-' - порог, 'm' - статус 3с"));
-    Serial.println(F("Ожидание оптического сигнала...\n"));
+    Serial.println(F("Команды: 'c' - калибровка, '+' / '-' - подстройка порога, 'r' - замер"));
+    Serial.println(F("Готов к приему оптического сигнала...\n"));
 }
 
 // ==========================================
 // ГЛАВНЫЙ ЦИКЛ (LOOP)
 // ==========================================
 void loop() {
-    // 1. Проверка команд управления
+    // 1. Проверка команд от пользователя из монитора порта
     handleSerialCommands();
 
-    // 2. Ожидание оптического старт-бита
+    // 2. Ожидание появления светового импульса (Start-бит)
     if (isLightPresent()) {
         uint8_t receivedByte = 0;
 
+        // Попытка приема байта с абсолютной микросекундной фазировкой
         if (receiveByte(receivedByte)) {
             char ch = static_cast<char>(receivedByte);
             processIncomingByte(ch);
         }
     }
 
-    // 3. Завершение фразы по таймауту тишины (полная остановка)
-    if (isReceivingMessage && (millis() - lastCharTime > MESSAGE_FLUSH_TIMEOUT_MS)) {
-        flushMessageBuffer();
-    }
-
-    // 4. Отчет каждые 3 секунды (только если сейчас не идет прием фразы)
-    if (!isReceivingMessage && liveStreamEnabled && (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS)) {
-        lastTelemetryTime = millis();
-        printTelemetryReport();
+    // 3. Завершение фразы по таймауту тишины
+    if (isReceivingPhrase && (millis() - lastCharTime > MESSAGE_TIMEOUT_MS)) {
+        finalizeSentence();
     }
 }
 
 // ==========================================
-// ФУНКЦИИ СИНХРОНИЗАЦИИ И ПРИЕМА
+// АЛГОРИТМ ПРИЕМА (МИКРОСЕКУНДНАЯ ТОЧНОСТЬ)
 // ==========================================
 
 bool isLightPresent() {
@@ -115,42 +105,54 @@ bool isLightPresent() {
 }
 
 /**
- * @brief Прецизионный прием одного байта по протоколу UART (8-N-1)
+ * @brief Прецизионный прием байта с абсолютной временной привязкой (Zero Cumulative Drift)
  */
 bool receiveByte(uint8_t& outByte) {
-    // Шаг 1: Центр стартового бита (T/2 = 25 мс)
-    delay(BIT_PERIOD_MS / 2);
-    int sample = analogRead(RX_PIN);
-    if (sample < (thresholdValue - HYSTERESIS)) {
-        return false; // Ложный импульс/шум
-    }
+    uint32_t frameStartUs = micros();
 
-    // Шаг 2: Центр Бита 0 (+50 мс)
-    delay(BIT_PERIOD_MS);
+    // Шаг 1: Проверка центра стартового бита (+ 0.5 * T = 25 000 мкс)
+    while ((long)(micros() - (frameStartUs + (BIT_PERIOD_US / 2))) < 0) {
+        // Ожидание центра старт-бита
+    }
+    
+    int startSample = analogRead(RX_PIN);
+    if (startSample < (thresholdValue - HYSTERESIS)) {
+        return false; // Ложный шум / кратковременный блик
+    }
 
     uint8_t reconstructedByte = 0;
 
-    // Шаг 3: Считывание 8 бит данных строго в центрах
+    // Шаг 2: Считывание 8 бит данных строго в абсолютных точках времени:
+    // Бит 0: frameStart + 1.5 * T
+    // Бит 1: frameStart + 2.5 * T ...
+    // Бит 7: frameStart + 8.5 * T
     for (uint8_t bitIdx = 0; bitIdx < 8; bitIdx++) {
-        uint32_t bitStart = millis();
+        uint32_t targetUs = frameStartUs + (BIT_PERIOD_US * 3 / 2) + ((uint32_t)bitIdx * BIT_PERIOD_US);
+        
+        while ((long)(micros() - targetUs) < 0) {
+            // Точное ожидание центра бита без накопления ошибки
+        }
 
         int bitAdc = analogRead(RX_PIN);
         if (bitAdc >= (thresholdValue - HYSTERESIS)) {
             reconstructedByte |= (1 << bitIdx);
         }
-
-        // Прецизионное ожидание 50 мс
-        while (millis() - bitStart < BIT_PERIOD_MS) {
-            // NOP
-        }
     }
 
-    // Шаг 4: Проверка стопового бита (должен быть LOW)
+    // Шаг 3: Проверка стопового бита (frameStart + 9.5 * T)
+    uint32_t stopTargetUs = frameStartUs + (BIT_PERIOD_US * 19 / 2);
+    while ((long)(micros() - stopTargetUs) < 0) {
+        // Ожидание центра стоп-бита
+    }
+
     int stopAdc = analogRead(RX_PIN);
     bool isStopValid = (stopAdc < thresholdValue);
 
-    // Дожидаемся окончания стоп-бита (20 мс)
-    delay(BIT_PERIOD_MS / 2);
+    // Дожидаемся окончания стоп-бита (frameStart + 10.0 * T)
+    uint32_t frameEndUs = frameStartUs + (BIT_PERIOD_US * 10);
+    while ((long)(micros() - frameEndUs) < 0) {
+        // Ожидание конца кадра
+    }
 
     if (isStopValid) {
         outByte = reconstructedByte;
@@ -161,88 +163,54 @@ bool receiveByte(uint8_t& outByte) {
 }
 
 // ==========================================
-// ОБРАБОТКА СИМВОЛОВ И БУФЕРА
+// ОБРАБОТКА СИМВОЛОВ И ЕДИНАЯ СТРОКА
 // ==========================================
 
 void processIncomingByte(char ch) {
     lastCharTime = millis();
-    isReceivingMessage = true;
 
-    // 1. Быстрый визуальный вывод принятого символа в поток
-    if (ch == ' ') {
-        Serial.print(F("[ПРОБЕЛ] "));
-    } else if (ch == '\n' || ch == '\r') {
-        Serial.println(F("[КОНЕЦ СТРОКИ]"));
-    } else if (ch >= 32 && ch <= 126) {
-        Serial.print(F("'"));
-        Serial.print(ch);
-        Serial.print(F("' "));
+    // Если это первый символ новой фразы — печатаем заголовок
+    if (!isReceivingPhrase) {
+        isReceivingPhrase = true;
+        Serial.print(F("[Li-Fi Прием]: "));
     }
 
-    // 2. Если пришел символ конца строки (\n) -> сразу завершаем фразу
+    // Обработка символа конца строки
     if (ch == '\n' || ch == '\r') {
-        flushMessageBuffer();
+        finalizeSentence();
         return;
     }
 
-    // 3. Сохраняем символ (включая ПРОБЕЛЫ) в общий буфер сообщения
+    // Добавляем символ (включая ПРОБЕЛ) в текущую строку и буфер
     if (ch >= 32 && ch <= 126) {
+        Serial.print(ch); // Мгновенный вывод символа в консоль
+
         if (bufferIndex < BUFFER_SIZE - 1) {
-            messageBuffer[bufferIndex++] = ch;
-            messageBuffer[bufferIndex] = '\0';
-        } else {
-            // Переполнение буфера
-            flushMessageBuffer();
-            messageBuffer[bufferIndex++] = ch;
-            messageBuffer[bufferIndex] = '\0';
+            sentenceBuffer[bufferIndex++] = ch;
+            sentenceBuffer[bufferIndex] = '\0';
         }
     }
 }
 
 /**
- * @brief Вывод всей принятой фразы (с пробелами и несколькими словами)
+ * @brief Окончание фразы и вывод итогового сообщения
  */
-void flushMessageBuffer() {
-    isReceivingMessage = false;
+void finalizeSentence() {
+    if (!isReceivingPhrase && bufferIndex == 0) return;
 
-    if (bufferIndex == 0) return;
+    isReceivingPhrase = false;
+    Serial.println(); // Перевод строки после потока символов
 
-    Serial.println();
-    Serial.println(F("\n======================================================="));
-    Serial.print(F(">>> [ИТОГОВОЕ СООБЩЕНИЕ]: \""));
-    Serial.print(messageBuffer);
-    Serial.println(F("\""));
-    Serial.print(F(">>> [ДЛИНА]: "));
-    Serial.print(bufferIndex);
-    Serial.println(F(" символов"));
-    Serial.println(F("=======================================================\n"));
+    if (bufferIndex > 0) {
+        Serial.println(F("-------------------------------------------------------"));
+        Serial.print(F(">>> [ИТОГОВОЕ СООБЩЕНИЕ]: \""));
+        Serial.print(sentenceBuffer);
+        Serial.println(F("\""));
+        Serial.println(F("-------------------------------------------------------\n"));
+    }
 
     bufferIndex = 0;
-    messageBuffer[0] = '\0';
-}
-
-// ==========================================
-// ПЕРИОДИЧЕСКИЙ ОТЧЕТ (РАЗ В 3 СЕКУНДЫ)
-// ==========================================
-
-void printTelemetryReport() {
-    int curAdc = analogRead(RX_PIN);
-    bool lightState = (curAdc >= thresholdValue);
-
-    Serial.print(F("[СТАТУС 3 сек] Датчик А0: "));
-    if (curAdc < 100) Serial.print(F(" "));
-    if (curAdc < 10)  Serial.print(F(" "));
-    Serial.print(curAdc);
-    Serial.print(F(" / 1023 | Порог: "));
-    Serial.print(thresholdValue);
-    Serial.print(F(" | Шум: "));
-    Serial.print(ambientNoiseLevel);
-    
-    if (lightState) {
-        Serial.println(F(" | Состояние: [СВЕТ ОБНАРУЖЕН]"));
-    } else {
-        Serial.println(F(" | Состояние: [ОЖИДАНИЕ СИГНАЛА]"));
-    }
+    sentenceBuffer[0] = '\0';
 }
 
 // ==========================================
@@ -250,10 +218,10 @@ void printTelemetryReport() {
 // ==========================================
 
 void calibrateAmbientLight() {
-    Serial.println(F("\n[КАЛИБРОВКА] Анализ освещения в помещении (1.5 сек)..."));
+    Serial.println(F("\n[КАЛИБРОВКА] Измерение фонового света..."));
 
     long sum = 0;
-    constexpr int SAMPLES = 100;
+    constexpr int SAMPLES = 80;
     int minVal = 1023;
     int maxVal = 0;
 
@@ -262,18 +230,18 @@ void calibrateAmbientLight() {
         sum += val;
         if (val < minVal) minVal = val;
         if (val > maxVal) maxVal = val;
-        delay(15);
+        delay(10);
     }
 
     ambientNoiseLevel = sum / SAMPLES;
-    thresholdValue = max(ambientNoiseLevel + NOISE_MARGIN, maxVal + (NOISE_MARGIN / 2));
-    thresholdValue = constrain(thresholdValue, 30, 950);
+    thresholdValue = max(ambientNoiseLevel + NOISE_MARGIN, maxVal + 15);
+    thresholdValue = constrain(thresholdValue, 25, 950);
 
-    Serial.print(F("[КАЛИБРОВКА] Фоновый шум: "));
+    Serial.print(F("[КАЛИБРОВКА] Фон (темнота): "));
     Serial.print(ambientNoiseLevel);
-    Serial.print(F(", Пик: "));
+    Serial.print(F(", Пик шума: "));
     Serial.print(maxVal);
-    Serial.print(F(" -> Порог (Threshold): "));
+    Serial.print(F(" -> Установлен порог: "));
     Serial.print(thresholdValue);
     Serial.println(F(" (ADC 0..1023)\n"));
 }
@@ -284,17 +252,20 @@ void handleSerialCommands() {
         if (cmd == 'c' || cmd == 'C') {
             calibrateAmbientLight();
         } else if (cmd == '+') {
-            thresholdValue = min(1000, thresholdValue + 20);
-            Serial.print(F("[НАСТРОЙКА] Порог увеличен: "));
+            thresholdValue = min(1000, thresholdValue + 15);
+            Serial.print(F("[РУЧНАЯ НАСТРОЙКА] Порог увеличен: "));
             Serial.println(thresholdValue);
         } else if (cmd == '-') {
-            thresholdValue = max(10, thresholdValue - 20);
-            Serial.print(F("[НАСТРОЙКА] Порог уменьшен: "));
+            thresholdValue = max(10, thresholdValue - 15);
+            Serial.print(F("[РУЧНАЯ НАСТРОЙКА] Порог уменьшен: "));
             Serial.println(thresholdValue);
-        } else if (cmd == 'm' || cmd == 'M') {
-            liveStreamEnabled = !liveStreamEnabled;
-            Serial.print(F("[НАСТРОЙКА] Отчет 3с: "));
-            Serial.println(liveStreamEnabled ? F("ВКЛ") : F("ВЫКЛ"));
+        } else if (cmd == 'r' || cmd == 'R') {
+            int cur = analogRead(RX_PIN);
+            Serial.print(F("[ТЕКУЩИЙ ЗАМЕР] АЦП = "));
+            Serial.print(cur);
+            Serial.print(F(" / 1023 | Порог = "));
+            Serial.print(thresholdValue);
+            Serial.println((cur >= thresholdValue) ? F(" [СВЕТ ВКЛЮЧЕН]") : F(" [ТЕМНОТА]"));
         }
     }
 }

@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - С НАДЕЖНОЙ МЕЖСИМВОЛЬНОЙ СИНХРОНИЗАЦИЕЙ
+ * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - МИКРОСЕКУНДНАЯ ТОЧНОСТЬ ПЕРЕДАЧИ
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * СВЕТОДИОД: Модуль LED на Pin 13
  * ============================================================================
@@ -14,15 +14,14 @@
 // ==========================================
 constexpr uint8_t TX_PIN = 13;                         // Цифровой пин управления LED
 constexpr uint16_t BAUD_RATE = 20;                     // Скорость передачи: 20 бит/с
-constexpr uint32_t BIT_PERIOD_MS = 1000 / BAUD_RATE;   // Длительность одного бита: 50 мс
+constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // Длительность бита: 50 000 мкс (50 мс)
 
-// Межсимвольная пауза (Guard Interval) для надежной синхронизации
-constexpr uint32_t INTER_BYTE_DELAY_MS = BIT_PERIOD_MS; // 50 мс темноты между символами
+// Межсимвольная защитная пауза (50 мс темноты)
+constexpr uint32_t INTER_BYTE_DELAY_US = BIT_PERIOD_US;
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
 // ==========================================
-void sendBit(bool bitVal);
 void sendByte(uint8_t data);
 void sendString(const char* str);
 
@@ -31,7 +30,7 @@ void sendString(const char* str);
 // ==========================================
 void setup() {
     pinMode(TX_PIN, OUTPUT);
-    digitalWrite(TX_PIN, LOW); // Линия в покое (LED выключен)
+    digitalWrite(TX_PIN, LOW); // Светодиод выключен в покое
 
     Serial.begin(115200);
     delay(500);
@@ -41,14 +40,11 @@ void setup() {
     Serial.println(F("======================================================="));
     Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
-    Serial.print(F(" бод (бит/с) | Бит: "));
-    Serial.print(BIT_PERIOD_MS);
-    Serial.println(F(" мс"));
-    Serial.print(F("[INFO] Межсимвольная пауза: "));
-    Serial.print(INTER_BYTE_DELAY_MS);
+    Serial.print(F(" бод | Длительность бита: "));
+    Serial.print(BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
     Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Введите фразу из нескольких слов с пробелами и нажмите Enter:\n"));
+    Serial.println(F("Введите предложение с пробелами и нажмите Enter:\n"));
 }
 
 // ==========================================
@@ -60,19 +56,19 @@ void loop() {
         input.trim();
         
         if (input.length() > 0) {
-            Serial.print(F("\n[TX] Отправка сообщения (длина: "));
+            Serial.print(F("\n[TX] Отправка ("));
             Serial.print(input.length());
             Serial.print(F(" симв.): \""));
             Serial.print(input);
             Serial.println(F("\""));
             
-            // 1. Передача всех символов строки (включая пробелы между словами)
+            // Передача всех символов (включая пробелы)
             sendString(input.c_str());
             
-            // 2. Отправка символа переноса строки (\n) как маркер ПОЛНОЙ ОСТАНОВКИ
+            // Символ переноса строки как маркер завершения фразы
             sendByte('\n');
             
-            Serial.println(F("[TX] Сообщение успешно отправлено!\n"));
+            Serial.println(F("[TX] Отправка успешно завершена!\n"));
         }
     }
 }
@@ -82,35 +78,32 @@ void loop() {
 // ==========================================
 
 /**
- * @brief Прецизионная передача одного бита
- */
-void sendBit(bool bitVal) {
-    uint32_t startTime = millis();
-    digitalWrite(TX_PIN, bitVal ? HIGH : LOW);
-    
-    while (millis() - startTime < BIT_PERIOD_MS) {
-        // Ожидание периода бита
-    }
-}
-
-/**
- * @brief Передача байта по протоколу UART (8-N-1) + Защитная пауза
+ * @brief Прецизионная отправка байта с абсолютной микросекундной фазировкой
  */
 void sendByte(uint8_t data) {
-    // 1. СТАРТОВЫЙ БИТ (HIGH - световой импульс)
-    sendBit(true);
+    uint32_t frameStartUs = micros();
+
+    // 1. СТАРТОВЫЙ БИТ (HIGH)
+    digitalWrite(TX_PIN, HIGH);
+    while ((long)(micros() - (frameStartUs + BIT_PERIOD_US)) < 0);
 
     // 2. 8 БИТ ДАННЫХ (LSB first)
     for (uint8_t i = 0; i < 8; i++) {
         bool bit = (data >> i) & 0x01;
-        sendBit(bit);
+        digitalWrite(TX_PIN, bit ? HIGH : LOW);
+        
+        uint32_t targetUs = frameStartUs + ((uint32_t)(i + 2) * BIT_PERIOD_US);
+        while ((long)(micros() - targetUs) < 0);
     }
 
-    // 3. СТОПОВЫЙ БИТ (LOW - темнота)
-    sendBit(false);
+    // 3. СТОПОВЫЙ БИТ (LOW)
+    digitalWrite(TX_PIN, LOW);
+    uint32_t stopTargetUs = frameStartUs + (10UL * BIT_PERIOD_US);
+    while ((long)(micros() - stopTargetUs) < 0);
 
-    // 4. МЕЖСИМВОЛЬНАЯ ЗАЩИТНАЯ ПАУЗА (LOW)
-    delay(INTER_BYTE_DELAY_MS);
+    // 4. МЕЖСИМВОЛЬНАЯ ПАУЗА (LOW)
+    uint32_t guardTargetUs = stopTargetUs + INTER_BYTE_DELAY_US;
+    while ((long)(micros() - guardTargetUs) < 0);
 }
 
 /**
