@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПРИЕМНИК (RX) - СКОРОСТНОЙ РЕЖИМ (50 БОД) + CRC-8 + ДИНАМИЧЕСКИЙ 5X
+ * МОДУЛЬ: ПРИЕМНИК (RX) - СТАБИЛЬНЫЙ РЕЖИМ 30 БОД + CRC-8 + 3X ОВЕРСЭМПЛИНГ
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор 10 кОм -> GND)
  * ============================================================================
@@ -13,16 +13,16 @@
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ СКОРОСТИ
 // ==========================================
 constexpr uint8_t RX_PIN = A0;                         // Аналоговый вход фотодиода
-constexpr uint16_t BAUD_RATE = 50;                     // Увеличенная скорость: 50 бит/с (было 20)
-constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // Длительность одного бита: 20 000 мкс (20 мс)
+constexpr uint16_t BAUD_RATE = 30;                     // Оптимальная скорость: 30 бит/с (33.3 мс)
+constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
 
 // Буфер для сборки предложения
 constexpr size_t BUFFER_SIZE = 256;
 char sentenceBuffer[BUFFER_SIZE];
 size_t bufferIndex = 0;
 
-// Таймаут тишины (окончание всей фразы): 350 мс (быстрое завершение)
-constexpr uint32_t MESSAGE_TIMEOUT_MS = 350;
+// Таймаут тишины (окончание всей фразы): 500 мс
+constexpr uint32_t MESSAGE_TIMEOUT_MS = 500;
 uint32_t lastCharTime = 0;
 bool isReceivingMessage = false;
 
@@ -36,8 +36,8 @@ RxPacketState rxState = STATE_PAYLOAD;
 // Порог срабатывания и параметры калибровки
 int ambientNoiseLevel = 0;                              // Базовый уровень шума (темнота)
 int thresholdValue = 60;                               // Порог переключения (ADC 0..1023)
-constexpr int NOISE_MARGIN = 35;                        // Запас над шумом
-constexpr int HYSTERESIS = 10;                          // Гистерезис
+constexpr int NOISE_MARGIN = 40;                        // Запас над шумом
+constexpr int HYSTERESIS = 12;                          // Гистерезис
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
@@ -62,14 +62,13 @@ void setup() {
     delay(500);
 
     Serial.println(F("\n============================================================"));
-    Serial.println(F("    >>> Li-Fi ПРИЕМНИК (RX) [TURBO 50 BAUD + CRC-8] <<<     "));
+    Serial.println(F("     >>> Li-Fi ПРИЕМНИК (RX) [30 BAUD + CRC-8] <<<          "));
     Serial.println(F("============================================================"));
     Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
-    Serial.println(F(" мс (Ускорено в 2.5 раза!)"));
-    Serial.println(F("[INFO] Динамическое 5-кратное сэмплирование центра бита."));
+    Serial.println(F(" мс (Оптимальная стабильность)"));
     Serial.println(F("[INFO] В темноте - тишина (спам отключен)."));
 
     // Автокалибровка порога под освещение
@@ -91,13 +90,13 @@ void loop() {
     if (isLightPresent()) {
         uint8_t receivedByte = 0;
 
-        // Прием байта с 5-кратной мажоритарной фильтрацией
+        // Прием байта
         if (receiveByte(receivedByte)) {
             processIncomingByte(receivedByte);
         }
     }
 
-    // 3. Завершение фразы по таймауту тишины (если CRC не пришел вовремя)
+    // 3. Завершение фразы по таймауту тишины
     if (isReceivingMessage && (millis() - lastCharTime > MESSAGE_TIMEOUT_MS)) {
         finalizeMessageWithCRC(false, 0);
     }
@@ -123,7 +122,7 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 }
 
 // ==========================================
-// АЛГОРИТМ ПРИЕМА И 5-КРАТНАЯ ВЫБОРКА
+// АЛГОРИТМ ПРИЕМА И ВЫБОРКА
 // ==========================================
 
 bool isLightPresent() {
@@ -131,17 +130,14 @@ bool isLightPresent() {
 }
 
 /**
- * @brief 5-кратное сэмплирование вокруг центра бита
- * Интервалы автоматически масштабируются под выбранную скорость (BAUD_RATE)
+ * @brief 3-кратное сэмплирование в центре бита (-2мс, 0мс, +2мс)
+ * Идеально для 33.3 мс бита: фильтрует помехи и не задевает спад фотодиода
  */
 bool sampleBitWithVoting(uint32_t bitCenterUs) {
     int highVotes = 0;
-    
-    // Шаг между сэмплами: 1/16 от длительности бита (для 20 мс -> 1250 мкс)
-    const int32_t stepUs = (int32_t)(BIT_PERIOD_US / 16);
-    const int32_t offsetsUs[5] = {-2 * stepUs, -stepUs, 0, stepUs, 2 * stepUs};
+    constexpr int32_t offsetsUs[3] = {-2000, 0, 2000};
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 3; i++) {
         uint32_t sampleTimeUs = bitCenterUs + offsetsUs[i];
         while ((long)(micros() - sampleTimeUs) < 0);
         
@@ -151,7 +147,7 @@ bool sampleBitWithVoting(uint32_t bitCenterUs) {
         }
     }
 
-    return (highVotes >= 3);
+    return (highVotes >= 2);
 }
 
 /**
@@ -169,15 +165,9 @@ bool receiveByte(uint8_t& outByte) {
         return false; // Ложный блик
     }
 
-    Serial.println(F("\n=================[ ПРИЕМ ОПТИЧЕСКОГО КАДРА ]================="));
-    Serial.print(F(">> [СТАРТ-БИТ] Подтвержден (АЦП: "));
-    Serial.print(startSample);
-    Serial.println(F(" >= Порога)"));
-
     uint8_t reconstructedByte = 0;
-    Serial.print(F(">> [БИТЫ 0..7 (5x)]: "));
 
-    // Шаг 2: Считывание 8 бит с 5-кратной выборкой на каждом бите
+    // Шаг 2: Считывание 8 бит
     for (uint8_t bitIdx = 0; bitIdx < 8; bitIdx++) {
         uint32_t bitCenterUs = frameStartUs + (BIT_PERIOD_US * 3 / 2) + ((uint32_t)bitIdx * BIT_PERIOD_US);
 
@@ -185,12 +175,8 @@ bool receiveByte(uint8_t& outByte) {
 
         if (bitVal) {
             reconstructedByte |= (1 << bitIdx);
-            Serial.print(F("1 "));
-        } else {
-            Serial.print(F("0 "));
         }
     }
-    Serial.println();
 
     // Шаг 3: Проверка стоп-бита (+ 9.5 * T)
     uint32_t stopCenterUs = frameStartUs + (BIT_PERIOD_US * 19 / 2);
@@ -204,18 +190,11 @@ bool receiveByte(uint8_t& outByte) {
     while ((long)(micros() - frameEndUs) < 0);
 
     if (isStopValid) {
-        Serial.print(F(">> [СТОП-БИТ]   КОРРЕКТЕН (АЦП: "));
-        Serial.print(stopAdc);
-        Serial.println(F(" < Порога) -> OK!"));
         outByte = reconstructedByte;
         return true;
-    } else {
-        Serial.print(F(">> [СТОП-БИТ]   ОШИБКА! Стоп-бит = HIGH (АЦП: "));
-        Serial.print(stopAdc);
-        Serial.println(F(" >= Порога)"));
-        Serial.println(F("============================================================\n"));
-        return false;
     }
+
+    return false;
 }
 
 // ==========================================
@@ -229,51 +208,9 @@ void processIncomingByte(uint8_t byteVal) {
 
     // Если ждем контрольный байт CRC-8
     if (rxState == STATE_WAIT_CRC) {
-        Serial.println(F("------------------------------------------------------------"));
-        Serial.print(F(">>> [ПРИНЯТ БАЙТ CRC-8]: 0x"));
-        if (byteVal < 16) Serial.print(F("0"));
-        Serial.print(byteVal, HEX);
-        Serial.println(F(" (Контроль целостности)"));
-        Serial.println(F("============================================================\n"));
-
         finalizeMessageWithCRC(true, byteVal);
         return;
     }
-
-    // Вывод диагностической карточки принятого символа
-    Serial.println(F("------------------------------------------------------------"));
-    Serial.print(F(">>> ПРИНЯТ СИМВОЛ: "));
-    if (ch == ' ') {
-        Serial.print(F("[ПРОБЕЛ]"));
-    } else if (ch >= 'A' && ch <= 'Z') {
-        Serial.print(F("'"));
-        Serial.print(ch);
-        Serial.print(F("' (ЗАГЛАВНАЯ)"));
-    } else if (ch >= 'a' && ch <= 'z') {
-        Serial.print(F("'"));
-        Serial.print(ch);
-        Serial.print(F("' (строчная)"));
-    } else if (ch >= '0' && ch <= '9') {
-        Serial.print(F("'"));
-        Serial.print(ch);
-        Serial.print(F("' (цифра)"));
-    } else if (ch == '\n') {
-        Serial.print(F("[МАРКЕР ОКОНЧАНИЯ ТЕКСТА \\n]"));
-    } else {
-        Serial.print(F("'"));
-        Serial.print(ch);
-        Serial.print(F("'"));
-    }
-    
-    Serial.print(F(" | ASCII: "));
-    Serial.print((int)byteVal);
-    Serial.print(F(" | HEX: 0x"));
-    if (byteVal < 16) Serial.print(F("0"));
-    Serial.print(byteVal, HEX);
-    Serial.print(F(" | BIN: 0b"));
-    for (int i = 7; i >= 0; i--) Serial.print((byteVal >> i) & 1);
-    Serial.println();
-    Serial.println(F("============================================================\n"));
 
     // Если пришел маркер окончания текста -> переключаемся в ожидание CRC-8
     if (ch == '\n' || ch == '\r') {
@@ -281,8 +218,10 @@ void processIncomingByte(uint8_t byteVal) {
         return;
     }
 
-    // Сохраняем символ полезной нагрузки
+    // Быстрый вывод символа в поток
     if (ch >= 32 && ch <= 126) {
+        Serial.print(ch);
+
         if (bufferIndex < BUFFER_SIZE - 1) {
             sentenceBuffer[bufferIndex++] = ch;
             sentenceBuffer[bufferIndex] = '\0';
@@ -299,9 +238,11 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
 
     if (bufferIndex == 0) return;
 
+    // Рассчитываем контрольную сумму от полученных данных
     uint8_t calculatedCRC = calculateCRC8(reinterpret_cast<const uint8_t*>(sentenceBuffer), bufferIndex);
 
-    Serial.println(F("************************************************************"));
+    Serial.println();
+    Serial.println(F("\n************************************************************"));
     Serial.print(F(">>> [ИТОГОВОЕ СООБЩЕНИЕ]: \""));
     Serial.print(sentenceBuffer);
     Serial.println(F("\""));
