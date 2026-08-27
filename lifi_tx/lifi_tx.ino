@@ -1,9 +1,9 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПЕРЕДАТЧИК (TX) С ДЕТАЛЬНОЙ ВИЗУАЛИЗАЦИЕЙ ОТПРАВКИ
+ * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - С НАДЕЖНОЙ МЕЖСИМВОЛЬНОЙ СИНХРОНИЗАЦИЕЙ
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
- * СВЕТОДИОД: Светодиод / модуль на Pin 13 (GND -> GND, Signal -> D13)
+ * СВЕТОДИОД: Модуль LED на Pin 13
  * ============================================================================
  */
 
@@ -12,9 +12,12 @@
 // ==========================================
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ
 // ==========================================
-constexpr uint8_t TX_PIN = 13;               // Цифровой пин управления LED
-constexpr uint16_t BAUD_RATE = 20;           // Скорость передачи: 20 бит/с
-constexpr uint32_t BIT_PERIOD_MS = 1000 / BAUD_RATE; // Длительность одного бита: 50 мс
+constexpr uint8_t TX_PIN = 13;                         // Цифровой пин управления LED
+constexpr uint16_t BAUD_RATE = 20;                     // Скорость передачи: 20 бит/с
+constexpr uint32_t BIT_PERIOD_MS = 1000 / BAUD_RATE;   // Длительность одного бита: 50 мс
+
+// Межсимвольная пауза (Guard Interval) для идеальной синхронизации длинных слов
+constexpr uint32_t INTER_BYTE_DELAY_MS = BIT_PERIOD_MS; // 50 мс темноты между символами
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
@@ -28,24 +31,24 @@ void sendString(const char* str);
 // ==========================================
 void setup() {
     pinMode(TX_PIN, OUTPUT);
-    digitalWrite(TX_PIN, LOW); // Линия в состоянии покоя (свет выключен)
+    digitalWrite(TX_PIN, LOW); // Линия в состоянии покоя (светодиод выключен)
 
     Serial.begin(115200);
-    while (!Serial && millis() < 2000);
+    delay(500);
 
     Serial.println(F("\n======================================================="));
-    Serial.println(F("       Li-Fi TRANSMITTER (TX) - READY TO TRANSMIT      "));
+    Serial.println(F("         >>> Li-Fi ПЕРЕДАТЧИК (TX) ГОТОВ <<<           "));
     Serial.println(F("======================================================="));
-    Serial.print(F("[CONFIG] Speed: "));
+    Serial.print(F("[INFO] Скорость: "));
     Serial.print(BAUD_RATE);
-    Serial.print(F(" baud | Bit duration: "));
+    Serial.print(F(" бод (бит/с) | Длительность бита: "));
     Serial.print(BIT_PERIOD_MS);
-    Serial.println(F(" ms"));
-    Serial.println(F("[CONFIG] TX Pin: D13 (LED)"));
-    Serial.println(F("[CONFIG] Frame format: START(1) + 8 DATA BITS (LSB) + STOP(0)"));
+    Serial.println(F(" мс"));
+    Serial.print(F("[INFO] Межсимвольная пауза: "));
+    Serial.print(INTER_BYTE_DELAY_MS);
+    Serial.println(F(" мс (гарантия приема длинных слов)"));
     Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Введите текст в строку ввода Serial Monitor и нажмите Enter:"));
-    Serial.println(F("=======================================================\n"));
+    Serial.println(F("Введите любое слово или фразу в монитор порта и нажмите Enter:\n"));
 }
 
 // ==========================================
@@ -54,81 +57,65 @@ void setup() {
 void loop() {
     if (Serial.available() > 0) {
         String input = Serial.readStringUntil('\n');
-        input.trim();
+        input.trim(); // Убираем лишние пробелы и \r
         
         if (input.length() > 0) {
-            Serial.println(F("\n>>>>>>>>>>>> [ НАЧАЛО ПЕРЕДАЧИ ] >>>>>>>>>>>>"));
-            Serial.print(F("[TX ТЕКСТ]: \""));
-            Serial.print(input);
-            Serial.print(F("\" (Длина: "));
+            Serial.print(F("[TX] Отправка строки (длина: "));
             Serial.print(input.length());
-            Serial.println(F(" симв.)"));
-            Serial.println(F("---------------------------------------------"));
+            Serial.print(F("): \""));
+            Serial.print(input);
+            Serial.println(F("\""));
             
-            // Передача каждого символа по оптическому каналу
+            // Передача каждого символа строки
             sendString(input.c_str());
             
-            // Завершающий пробел для сброса буфера на RX
+            // Завершающий пробел в конце строки
             sendByte(' ');
             
-            Serial.println(F("---------------------------------------------"));
-            Serial.println(F("<<<<<<<<<<<< [ ПЕРЕДАЧА ЗАВЕРШЕНА ] <<<<<<<<<<<<\n"));
-            Serial.println(F("Готов к следующему сообщению...\n"));
+            Serial.println(F("[TX] Отправка успешно завершена!\n"));
         }
     }
 }
 
 // ==========================================
-// РЕАЛИЗАЦИЯ ФУНКЦИЙ ПЕРЕДАЧИ
+// РЕАЛИЗАЦИЯ ПЕРЕДАЧИ
 // ==========================================
 
 /**
- * @brief Передача одного бита с точной выдержкой интервала времени.
+ * @brief Прецизионная передача одного бита
  */
 void sendBit(bool bitVal) {
     uint32_t startTime = millis();
     digitalWrite(TX_PIN, bitVal ? HIGH : LOW);
     
     while (millis() - startTime < BIT_PERIOD_MS) {
-        // Прецизионное ожидание периода бита
+        // Выдержка битового интервала
     }
 }
 
 /**
- * @brief Передача одного байта с подробным логом в Serial Monitor.
+ * @brief Передача байта по протоколу UART (8-N-1) + Межсимвольная защитная пауза
  */
 void sendByte(uint8_t data) {
-    char ch = static_cast<char>(data);
-    
-    Serial.print(F("[TX Символ]: '"));
-    if (ch >= 32 && ch <= 126) {
-        Serial.print(ch);
-    } else {
-        Serial.print(F("SPC"));
-    }
-    Serial.print(F("' | HEX: 0x"));
-    if (data < 16) Serial.print(F("0"));
-    Serial.print(data, HEX);
-    Serial.print(F(" | Биты: [START:1] -> "));
-
-    // 1. СТАРТОВЫЙ БИТ (HIGH)
+    // 1. СТАРТОВЫЙ БИТ (HIGH - световой импульс)
     sendBit(true);
 
-    // 2. 8 БИТ ДАННЫХ (LSB first)
+    // 2. 8 БИТ ДАННЫХ (LSB first - младшим битом вперед)
     for (uint8_t i = 0; i < 8; i++) {
         bool bit = (data >> i) & 0x01;
-        Serial.print(bit ? '1' : '0');
-        Serial.print(F(" "));
         sendBit(bit);
     }
 
-    // 3. СТОПОВЫЙ БИТ (LOW)
+    // 3. СТОПОВЫЙ БИТ (LOW - темнота)
     sendBit(false);
-    Serial.println(F("-> [STOP:0] OK"));
+
+    // 4. МЕЖСИМВОЛЬНАЯ ЗАЩИТНАЯ ПАУЗА (LOW)
+    // Гарантирует, что RX успеет обработать символ и четко поймать передний фронт следующего
+    delay(INTER_BYTE_DELAY_MS);
 }
 
 /**
- * @brief Передача строки.
+ * @brief Передача строки любой длины
  */
 void sendString(const char* str) {
     while (*str) {
