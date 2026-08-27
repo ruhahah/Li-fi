@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПРИЕМНИК (RX) - СТАБИЛЬНЫЙ РЕЖИМ 30 БОД + CRC-8 + 3X ОВЕРСЭМПЛИНГ
+ * МОДУЛЬ: ПРИЕМНИК (RX) - ПОЛНАЯ ПОДДЕРЖКА КИРИЛЛИЦЫ (UTF-8) + CRC-8
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор 10 кОм -> GND)
  * ============================================================================
@@ -13,11 +13,11 @@
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ СКОРОСТИ
 // ==========================================
 constexpr uint8_t RX_PIN = A0;                         // Аналоговый вход фотодиода
-constexpr uint16_t BAUD_RATE = 30;                     // Оптимальная скорость: 30 бит/с (33.3 мс)
+constexpr uint16_t BAUD_RATE = 30;                     // Скорость передачи: 30 бит/с (33.3 мс)
 constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
 
-// Буфер для сборки предложения
-constexpr size_t BUFFER_SIZE = 256;
+// Буфер для сборки UTF-8 текста любой длины (включая русские буквы и пробелы)
+constexpr size_t BUFFER_SIZE = 512;
 char sentenceBuffer[BUFFER_SIZE];
 size_t bufferIndex = 0;
 
@@ -57,18 +57,19 @@ void handleSerialCommands();
 void setup() {
     pinMode(RX_PIN, INPUT);
 
-    // Запуск Serial Monitor на 115200 бод
+    // Запуск Serial Monitor на 115200 бод (с полной поддержкой UTF-8)
     Serial.begin(115200);
     delay(500);
 
     Serial.println(F("\n============================================================"));
-    Serial.println(F("     >>> Li-Fi ПРИЕМНИК (RX) [30 BAUD + CRC-8] <<<          "));
+    Serial.println(F("     >>> Li-Fi ПРИЕМНИК (RX) [РУССКИЙ + ENGLISH] <<<        "));
     Serial.println(F("============================================================"));
     Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
-    Serial.println(F(" мс (Оптимальная стабильность)"));
+    Serial.println(F(" мс"));
+    Serial.println(F("[INFO] Включена поддержка кириллицы (UTF-8) и латиницы."));
     Serial.println(F("[INFO] В темноте - тишина (спам отключен)."));
 
     // Автокалибровка порога под освещение
@@ -122,7 +123,7 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 }
 
 // ==========================================
-// АЛГОРИТМ ПРИЕМА И ВЫБОРКА
+// АЛГОРИТМ ПРИЕМА
 // ==========================================
 
 bool isLightPresent() {
@@ -130,8 +131,7 @@ bool isLightPresent() {
 }
 
 /**
- * @brief 3-кратное сэмплирование в центре бита (-2мс, 0мс, +2мс)
- * Идеально для 33.3 мс бита: фильтрует помехи и не задевает спад фотодиода
+ * @brief 3-кратное сэмплирование в центре бита
  */
 bool sampleBitWithVoting(uint32_t bitCenterUs) {
     int highVotes = 0;
@@ -198,13 +198,12 @@ bool receiveByte(uint8_t& outByte) {
 }
 
 // ==========================================
-// ОБРАБОТКА СИМВОЛОВ И ПРОВЕРКА CRC-8
+// ОБРАБОТКА СИМВОЛОВ И UTF-8 (КИРИЛЛИЦА)
 // ==========================================
 
 void processIncomingByte(uint8_t byteVal) {
     lastCharTime = millis();
     isReceivingMessage = true;
-    char ch = static_cast<char>(byteVal);
 
     // Если ждем контрольный байт CRC-8
     if (rxState == STATE_WAIT_CRC) {
@@ -213,17 +212,18 @@ void processIncomingByte(uint8_t byteVal) {
     }
 
     // Если пришел маркер окончания текста -> переключаемся в ожидание CRC-8
-    if (ch == '\n' || ch == '\r') {
+    if (byteVal == '\n' || byteVal == '\r') {
         rxState = STATE_WAIT_CRC;
         return;
     }
 
-    // Быстрый вывод символа в поток
-    if (ch >= 32 && ch <= 126) {
-        Serial.print(ch);
+    // Разрешаем ВСЕ печатные байты (ASCII >= 32 и русские UTF-8 байты 128..255)
+    if (byteVal >= 32 && byteVal != 127) {
+        // Выводим байт напрямую в Serial (терминал сам склеит русские 2-байтовые символы UTF-8)
+        Serial.write(byteVal);
 
         if (bufferIndex < BUFFER_SIZE - 1) {
-            sentenceBuffer[bufferIndex++] = ch;
+            sentenceBuffer[bufferIndex++] = static_cast<char>(byteVal);
             sentenceBuffer[bufferIndex] = '\0';
         }
     }
@@ -238,7 +238,7 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
 
     if (bufferIndex == 0) return;
 
-    // Рассчитываем контрольную сумму от полученных данных
+    // Рассчитываем контрольную сумму от всех принятых байтов UTF-8
     uint8_t calculatedCRC = calculateCRC8(reinterpret_cast<const uint8_t*>(sentenceBuffer), bufferIndex);
 
     Serial.println();
@@ -246,9 +246,9 @@ void finalizeMessageWithCRC(bool hasCrc, uint8_t receivedCRC) {
     Serial.print(F(">>> [ИТОГОВОЕ СООБЩЕНИЕ]: \""));
     Serial.print(sentenceBuffer);
     Serial.println(F("\""));
-    Serial.print(F(">>> [ДЛИНА СООБЩЕНИЯ]:   "));
+    Serial.print(F(">>> [РАЗМЕР СООБЩЕНИЯ]:  "));
     Serial.print(bufferIndex);
-    Serial.println(F(" символов"));
+    Serial.println(F(" байт"));
 
     if (hasCrc) {
         Serial.print(F(">>> [КОНТРОЛЬ CRC-8]:     Расчетный = 0x"));

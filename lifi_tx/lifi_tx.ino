@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - СТАБИЛЬНЫЙ РЕЖИМ 30 БОД + CRC-8
+ * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - ПОЛНАЯ ПОДДЕРЖКА КИРИЛЛИЦЫ (UTF-8) + CRC-8
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * СВЕТОДИОД: Модуль LED на Pin 13
  * ============================================================================
@@ -13,10 +13,10 @@
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ СКОРОСТИ
 // ==========================================
 constexpr uint8_t TX_PIN = 13;                         // Цифровой пин управления LED
-constexpr uint16_t BAUD_RATE = 30;                     // Оптимальная скорость: 30 бит/с (33.3 мс на бит)
-constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // Длительность бита: 33 333 мкс
+constexpr uint16_t BAUD_RATE = 30;                     // Скорость: 30 бит/с (33.3 мс на бит)
+constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
 
-// Межсимвольная защитная пауза (33.3 мс темноты для надежного сброса фототока)
+// Межсимвольная защитная пауза
 constexpr uint32_t INTER_BYTE_DELAY_US = BIT_PERIOD_US;
 
 // ==========================================
@@ -37,16 +37,17 @@ void setup() {
     delay(500);
 
     Serial.println(F("\n======================================================="));
-    Serial.println(F("     >>> Li-Fi ПЕРЕДАТЧИК (TX) [30 BAUD + CRC-8] <<<   "));
+    Serial.println(F("     >>> Li-Fi ПЕРЕДАТЧИК (TX) [РУССКИЙ + ENGLISH] <<< "));
     Serial.println(F("======================================================="));
     Serial.print(F("[INFO] Скорость Li-Fi: "));
     Serial.print(BAUD_RATE);
-    Serial.print(F(" бод (бит/с) | Длительность бита: "));
+    Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
-    Serial.println(F("[INFO] Защита: Контрольная сумма CRC-8."));
+    Serial.println(F("[INFO] Поддержка языков: РУССКИЙ (UTF-8) и ENGLISH."));
+    Serial.println(F("[INFO] Контроль целостности: CRC-8."));
     Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Введите сообщение и нажмите Enter:\n"));
+    Serial.println(F("Введите фразу на русском или английском и нажмите Enter:\n"));
 }
 
 // ==========================================
@@ -58,21 +59,22 @@ void loop() {
         input.trim();
         
         if (input.length() > 0) {
+            // Расчет контрольной суммы от UTF-8 байтов
             uint8_t crc = calculateCRC8(reinterpret_cast<const uint8_t*>(input.c_str()), input.length());
 
             Serial.println(F("\n>>>>>>>>>>>>>> [ НАЧАЛО ПЕРЕДАЧИ ] >>>>>>>>>>>>>>"));
-            Serial.print(F("[TX] Текст: \""));
+            Serial.print(F("[TX] Сообщение: \""));
             Serial.print(input);
             Serial.println(F("\""));
-            Serial.print(F("[TX] Длина: "));
+            Serial.print(F("[TX] Размер: "));
             Serial.print(input.length());
-            Serial.print(F(" симв. | CRC-8: 0x"));
+            Serial.print(F(" байт | CRC-8: 0x"));
             if (crc < 16) Serial.print(F("0"));
             Serial.print(crc, HEX);
             Serial.println();
             Serial.println(F("-------------------------------------------------"));
             
-            // 1. Передача текста
+            // 1. Передача всех байтов строки (включая русские UTF-8 символы)
             sendString(input.c_str());
             
             // 2. Маркер окончания текста
