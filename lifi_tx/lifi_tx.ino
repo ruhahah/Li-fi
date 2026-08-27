@@ -15,10 +15,6 @@
 constexpr uint8_t TX_PIN = 13;               // Цифровой пин управления LED
 constexpr uint16_t BAUD_RATE = 20;           // Скорость передачи: 20 бит/с
 constexpr uint32_t BIT_PERIOD_MS = 1000 / BAUD_RATE; // Длительность одного бита: 50 мс
-constexpr uint32_t WORD_PAUSE_MS = 300;      // Пауза между отправкой строк (мс)
-
-// Тестовое сообщение для циклической передачи (если в Serial ничего не ввели)
-const char DEFAULT_MESSAGE[] = "Hello Li-Fi World! ";
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
@@ -35,7 +31,7 @@ void setup() {
     pinMode(TX_PIN, OUTPUT);
     digitalWrite(TX_PIN, LOW); // Линия в состоянии покоя (свет выключен)
 
-    // Инициализация аппаратного UART для монитора порта (управление и логи)
+    // Инициализация аппаратного UART для монитора порта (управление и ввод)
     Serial.begin(115200);
     while (!Serial && millis() < 2000); // Ожидание подключения Serial Monitor
 
@@ -48,8 +44,7 @@ void setup() {
     Serial.print(BIT_PERIOD_MS);
     Serial.println(F(" ms"));
     Serial.println(F("Frame format: 1 Start (HIGH) + 8 Data Bits (LSB first) + 1 Stop (LOW)"));
-    Serial.println(F("Type text into Serial Monitor and press Enter to send,"));
-    Serial.println(F("or wait for automatic periodic transmission."));
+    Serial.println(F("Mode: ON-DEMAND (Enter text in Serial Monitor and press Enter to transmit)"));
     Serial.println(F("========================================\n"));
 }
 
@@ -57,24 +52,24 @@ void setup() {
 // ГЛАВНЫЙ ЦИКЛ (LOOP)
 // ==========================================
 void loop() {
-    // 1. Проверка ввода из Serial Monitor
+    // Проверка ввода из Serial Monitor
     if (Serial.available() > 0) {
         String input = Serial.readStringUntil('\n');
         input.trim(); // Удаляем пробелы и переносы на концах
+        
         if (input.length() > 0) {
-            Serial.print(F("[TX Send User]: "));
-            Serial.println(input);
+            Serial.print(F("[TX Transmitting]: \""));
+            Serial.print(input);
+            Serial.println(F("\""));
+            
+            // Передача введенной строки по оптическому каналу
             sendString(input.c_str());
-            // Отправляем пробел в конце, чтобы приемник завершил слово
+            
+            // Отправляем пробел в конце для корректного завершения слова на стороне RX
             sendByte(' ');
+            
+            Serial.println(F("[TX Done]: Transmission finished. Ready for next input.\n"));
         }
-    } 
-    // 2. Если пользователь ничего не вводит, отправляем демонстрационную строку
-    else {
-        Serial.print(F("[TX Auto]: "));
-        Serial.println(DEFAULT_MESSAGE);
-        sendString(DEFAULT_MESSAGE);
-        delay(WORD_PAUSE_MS);
     }
 }
 
