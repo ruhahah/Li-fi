@@ -1,7 +1,7 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Полнодуплексная оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ТРАНСИВЕР (FULL-DUPLEX + ЦВЕТНОЙ ANSI ИНТЕРФЕЙС + PING + СЖАТИЕ + ARQ)
+ * МОДУЛЬ: ТРАНСИВЕР (FULL-DUPLEX + PING + СЖАТИЕ ТЕКСТА + БЫСТРЫЙ ARQ)
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * 
  * АППАРАТНАЯ КОНФИГУРАЦИЯ:
@@ -9,30 +9,17 @@
  *   - RX (Приемник):    Фотодиод BPW24 на Pin A0 (Катод -> 5V, Анод -> A0, Резистор -> GND)
  *   - Связь с ПК:       Hardware Serial UART (115200 baud)
  * 
- * ЦВЕТОВАЯ ПАЛИТРА ANSI:
- *   - 🟢 Зеленый:       Входящие принятые сообщения (RX), Успех, CRC OK
- *   - 🔵 Синий:         Исходящие сообщения (TX)
- *   - 🟣 Пурпурный:     Подтверждения доставки (ACK), Сжатие данных
- *   - 🟡 Желтый:        Оптический Ping, метрики SNR и качества канала
- *   - 🔴 Красный:       Ошибки CRC, перекрытие луча, таймауты
- *   - 🌐 Бирюзовый:     Заголовки и системный статус
+ * НОВЫЕ ВОЗМОЖНОСТИ:
+ *   1. Оптический Ping (команда 'ping'):
+ *      - Замеряет точное время отклика (RTT в мс) по лучу Li-Fi.
+ *   2. Сжатие текста (Li-Fi Lossless Compression):
+ *      - Сжимает русские буквы UTF-8 в 2 раза (убирает избыточные префиксы 0xD0/0xD1).
+ *      - Передача русских фраз становится в 2 раза быстрее!
+ *   3. Полнодуплексный неблокирующий движок (45 бод, быстрый ARQ).
  * ============================================================================
  */
 
 #include <Arduino.h>
-
-// ============================================================================
-// ANSI ЦВЕТОВЫЕ МАКРОСЫ
-// ============================================================================
-#define CLR_RESET   "\033[0m"
-#define CLR_BOLD    "\033[1m"
-#define CLR_RED     "\033[1;31m"
-#define CLR_GREEN   "\033[1;32m"
-#define CLR_YELLOW  "\033[1;33m"
-#define CLR_BLUE    "\033[1;34m"
-#define CLR_MAGENTA "\033[1;35m"
-#define CLR_CYAN    "\033[1;36m"
-#define CLR_WHITE   "\033[1;37m"
 
 // ============================================================================
 // КОНФИГУРАЦИЯ И КОНСТАНТЫ
@@ -199,26 +186,26 @@ void setup() {
     Serial.begin(115200);
     delay(400);
 
-    Serial.println(F("\n" CLR_CYAN "============================================================" CLR_RESET));
-    Serial.println(F(CLR_BOLD CLR_CYAN " >>> Li-Fi COLOR TRANSCEIVER [FULL-DUPLEX + PING + ARQ] <<< " CLR_RESET));
-    Serial.println(F(CLR_CYAN "============================================================" CLR_RESET));
-    Serial.print(F(CLR_WHITE "[INFO] Скорость Li-Fi:        " CLR_YELLOW));
+    Serial.println(F("\n============================================================"));
+    Serial.println(F(" >>> Li-Fi ТРАНСИВЕР [FULL-DUPLEX + PING + СЖАТИЕ + ARQ] <<< "));
+    Serial.println(F("============================================================"));
+    Serial.print(F("[INFO] Скорость Li-Fi:        "));
     Serial.print(Config::BAUD_RATE);
-    Serial.print(F(" бод " CLR_WHITE "| Период бита: " CLR_YELLOW));
+    Serial.print(F(" бод | Длительность бита: "));
     Serial.print(Config::BIT_PERIOD_US / 1000);
-    Serial.println(F(" мс" CLR_RESET));
-    Serial.println(F(CLR_WHITE "[INFO] Сжатие текста:          " CLR_MAGENTA "ВКЛЮЧЕНО (Кириллица x2)" CLR_RESET));
-    Serial.println(F(CLR_WHITE "[INFO] Оптический Ping:        " CLR_YELLOW "ВКЛЮЧЕНО (Команда 'ping')" CLR_RESET));
-    Serial.println(F(CLR_WHITE "[INFO] Режим связи:            " CLR_GREEN "FULL-DUPLEX (Одновременный TX/RX)" CLR_RESET));
+    Serial.println(F(" мс"));
+    Serial.println(F("[INFO] Сжатие данных:          ВКЛЮЧЕНО (Ускорение кириллицы x2)"));
+    Serial.println(F("[INFO] Оптический Ping:        ВКЛЮЧЕНО (Команда 'ping')"));
+    Serial.println(F("[INFO] Режим связи:            FULL-DUPLEX (Одновременный TX/RX)"));
 
     calibrateDarkness();
 
-    Serial.println(F(CLR_CYAN "------------------------------------------------------------" CLR_RESET));
-    Serial.println(F(CLR_BOLD "Команды:" CLR_RESET));
+    Serial.println(F("------------------------------------------------------------"));
+    Serial.println(F("Команды:"));
     Serial.println(F("  - Введите текст для отправки"));
-    Serial.println(F("  - " CLR_YELLOW "'ping'" CLR_RESET " - измерить задержку луча (RTT)"));
-    Serial.println(F("  - " CLR_CYAN "'c'" CLR_RESET " - калибровка фона, " CLR_CYAN "'r'" CLR_RESET " - замер АЦП"));
-    Serial.println(F(CLR_CYAN "------------------------------------------------------------\n" CLR_RESET));
+    Serial.println(F("  - 'ping' - измерить круговую задержку луча (RTT)"));
+    Serial.println(F("  - 'c' - калибровка темноты, 'r' - замер АЦП"));
+    Serial.println(F("------------------------------------------------------------\n"));
 }
 
 // ============================================================================
@@ -237,11 +224,17 @@ void loop() {
 }
 
 // ============================================================================
-// АЛГОРИТМ СЖАТИЯ КИРИЛЛИЦЫ UTF-8
+// АЛГОРИТМ БЫСТРОГО СЖАТИЯ (КИРИЛЛИЦА UTF-8 PACKING)
 // ============================================================================
+
+/**
+ * @brief Сжатие UTF-8 текста: убирает повторяющиеся префиксы 0xD0/0xD1
+ * Сжимает русские слова ровно в 2 раза!
+ */
 size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxDstLen) {
     if (maxDstLen < 2) return 0;
     
+    // Первый байт - флаг сжатия
     dst[0] = Config::FLAG_COMPRESSED;
     size_t dIdx = 1;
 
@@ -251,6 +244,7 @@ size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxD
         if (c1 == 0xD0 && i + 1 < srcLen) {
             uint8_t c2 = static_cast<uint8_t>(src[i + 1]);
             if (c2 >= 0x80 && c2 <= 0xBF) {
+                // Сжимаем пару 0xD0 + c2 в один токен (0x80..0xBF)
                 dst[dIdx++] = c2;
                 i++;
                 continue;
@@ -258,6 +252,7 @@ size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxD
         } else if (c1 == 0xD1 && i + 1 < srcLen) {
             uint8_t c2 = static_cast<uint8_t>(src[i + 1]);
             if (c2 >= 0x80 && c2 <= 0xBF) {
+                // Сжимаем пару 0xD1 + c2 в один токен (0xC0..0xFF)
                 dst[dIdx++] = (c2 + 0x40);
                 i++;
                 continue;
@@ -270,6 +265,9 @@ size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxD
     return dIdx;
 }
 
+/**
+ * @brief Распаковка сжатого потока обратно в чистый UTF-8
+ */
 size_t decompressPayload(const uint8_t* src, size_t srcLen, char* dst, size_t maxDstLen) {
     if (srcLen == 0 || maxDstLen == 0) return 0;
 
@@ -280,9 +278,11 @@ size_t decompressPayload(const uint8_t* src, size_t srcLen, char* dst, size_t ma
         uint8_t b = src[sIdx++];
 
         if (b >= 0x80 && b <= 0xBF) {
+            // Восстанавливаем префикс 0xD0
             dst[dIdx++] = static_cast<char>(0xD0);
             dst[dIdx++] = static_cast<char>(b);
         } else if (b >= 0xC0 && b <= 0xFF) {
+            // Восстанавливаем префикс 0xD1
             dst[dIdx++] = static_cast<char>(0xD1);
             dst[dIdx++] = static_cast<char>(b - 0x40);
         } else {
@@ -295,7 +295,7 @@ size_t decompressPayload(const uint8_t* src, size_t srcLen, char* dst, size_t ma
 }
 
 // ============================================================================
-// РАСЧЕТ CRC-8
+// РАСЧЕТ CRC-8 (Полином 0x07)
 // ============================================================================
 uint8_t calculateCRC8(const uint8_t* data, size_t len) {
     uint8_t crc = 0x00;
@@ -332,9 +332,9 @@ void sendPingRequest() {
     isWaitingForPingReply = true;
     pingStartTimeMs = millis();
 
-    Serial.println(F("\n" CLR_YELLOW "========================================================" CLR_RESET));
-    Serial.println(F(CLR_BOLD CLR_YELLOW ">>> [OPTICAL PING]: Отправка эхо-запроса по лучу Li-Fi..." CLR_RESET));
-    Serial.println(F(CLR_YELLOW "========================================================" CLR_RESET));
+    Serial.println(F("\n========================================================"));
+    Serial.println(F(">>> [OPTICAL PING]: Отправка эхо-запроса по лучу Li-Fi..."));
+    Serial.println(F("========================================================"));
 
     txQueue.push(Config::CTRL_PING_REQ);
 }
@@ -349,11 +349,13 @@ void handleSerialInput() {
         input.trim();
 
         if (input.length() > 0) {
+            // Команда PING
             if (input.equalsIgnoreCase("ping")) {
                 sendPingRequest();
                 return;
             }
 
+            // Служебные команды
             if (input.length() == 1) {
                 char cmd = input.charAt(0);
                 if (cmd == 'c' || cmd == 'C') {
@@ -361,13 +363,12 @@ void handleSerialInput() {
                     return;
                 } else if (cmd == 'r' || cmd == 'R') {
                     int cur = analogRead(Config::PIN_RX);
-                    Serial.print(F(CLR_CYAN "[АЦП]: " CLR_WHITE));
+                    Serial.print(F("[АЦП]: "));
                     Serial.print(cur);
-                    Serial.print(F(CLR_CYAN " | Фон: " CLR_WHITE));
+                    Serial.print(F(" | Фон: "));
                     Serial.print(ambientNoiseLevel);
-                    Serial.print(F(CLR_CYAN " | Порог: " CLR_YELLOW));
+                    Serial.print(F(" | Порог: "));
                     Serial.println(dynamicThreshold);
-                    Serial.print(F(CLR_RESET));
                     return;
                 }
             }
@@ -377,31 +378,33 @@ void handleSerialInput() {
             lastSentMessage[copyLen] = '\0';
             lastSentMessageLen = copyLen;
 
+            // Сжимаем текст перед отправкой
             uint8_t compBuf[Config::TX_QUEUE_SIZE];
             size_t compLen = compressPayload(lastSentMessage, lastSentMessageLen, compBuf, sizeof(compBuf));
+
             uint8_t crc = calculateCRC8(compBuf, compLen);
 
             isWaitingForAck = true;
             ackWaitStartTimeMs = millis();
             currentRetryCount = 0;
 
-            Serial.println(F("\n" CLR_BLUE ">>>>>>>>>>>>>> [ TX: ОТПРАВКА СООБЩЕНИЯ ] >>>>>>>>>>>>>>" CLR_RESET));
-            Serial.print(F(CLR_WHITE "[TX Текст]:     " CLR_BOLD CLR_BLUE "\""));
+            Serial.println(F("\n>>>>>>>>>>>>>> [ TX: ОТПРАВКА СООБЩЕНИЯ ] >>>>>>>>>>>>>>"));
+            Serial.print(F("[TX Текст]:     \""));
             Serial.print(lastSentMessage);
-            Serial.println(F("\"" CLR_RESET));
-            Serial.print(F(CLR_WHITE "[TX Сжатие]:    Исходный: " CLR_YELLOW));
+            Serial.println(F("\""));
+            Serial.print(F("[TX Сжатие]:    Исходный: "));
             Serial.print(lastSentMessageLen);
-            Serial.print(F(CLR_WHITE " байт -> В луче: " CLR_MAGENTA));
+            Serial.print(F(" байт -> В луче: "));
             Serial.print(compLen);
-            Serial.print(F(CLR_WHITE " байт (Экономия: " CLR_GREEN));
+            Serial.print(F(" байт (Экономия: "));
             int saved = 100 - (int)((compLen * 100) / lastSentMessageLen);
             Serial.print(max(0, saved));
-            Serial.println(F("%) 🗜️" CLR_RESET));
-            Serial.print(F(CLR_WHITE "[TX CRC-8]:     " CLR_YELLOW "0x"));
+            Serial.println(F("%) 🗜️"));
+            Serial.print(F("[TX CRC-8]:     0x"));
             if (crc < 16) Serial.print(F("0"));
             Serial.println(crc, HEX);
-            Serial.println(F(CLR_CYAN "[TX Статус]:    Ожидание подтверждения доставки (ACK)..." CLR_RESET));
-            Serial.println(F(CLR_BLUE "--------------------------------------------------------" CLR_RESET));
+            Serial.println(F("[TX Статус]:    Ожидание подтверждения доставки (ACK)..."));
+            Serial.println(F("--------------------------------------------------------"));
 
             sendRawPacket(compBuf, compLen, crc);
         }
@@ -409,28 +412,30 @@ void handleSerialInput() {
 }
 
 void handleArqTimeouts() {
+    // 1. Проверка таймаута PING
     if (isWaitingForPingReply && txQueue.isEmpty() && txState == TxState::IDLE) {
         if (millis() - pingStartTimeMs > 2000) {
             isWaitingForPingReply = false;
-            Serial.println(F("\n" CLR_RED "********************************************************" CLR_RESET));
-            Serial.println(F(CLR_BOLD CLR_RED ">>> [OPTICAL PING]: Таймаут ответа! Луч не дошел до цели ❌" CLR_RESET));
-            Serial.println(F(CLR_RED "********************************************************\n" CLR_RESET));
+            Serial.println(F("\n********************************************************"));
+            Serial.println(F(">>> [OPTICAL PING]: Таймаут ответа! Луч не дошел до цели ❌"));
+            Serial.println(F("********************************************************\n"));
         }
     }
 
+    // 2. Проверка таймаута ARQ
     if (isWaitingForAck && txQueue.isEmpty() && txState == TxState::IDLE) {
         if (millis() - ackWaitStartTimeMs > Config::ACK_TIMEOUT_MS) {
             if (currentRetryCount < Config::MAX_RETRIES) {
                 currentRetryCount++;
                 ackWaitStartTimeMs = millis();
 
-                Serial.println(F("\n" CLR_YELLOW "--------------------------------------------------------" CLR_RESET));
-                Serial.print(F(CLR_BOLD CLR_YELLOW ">>> [ARQ АВТОПОВТОР]: Таймаут. Повтор пакета (Попытка "));
+                Serial.println(F("\n--------------------------------------------------------"));
+                Serial.print(F(">>> [ARQ АВТОПОВТОР]: Таймаут. Повтор пакета (Попытка "));
                 Serial.print(currentRetryCount);
                 Serial.print(F(" из "));
                 Serial.print(Config::MAX_RETRIES);
-                Serial.println(F(")... 🔄" CLR_RESET));
-                Serial.println(F(CLR_YELLOW "--------------------------------------------------------" CLR_RESET));
+                Serial.println(F(")... 🔄"));
+                Serial.println(F("--------------------------------------------------------"));
 
                 uint8_t compBuf[Config::TX_QUEUE_SIZE];
                 size_t compLen = compressPayload(lastSentMessage, lastSentMessageLen, compBuf, sizeof(compBuf));
@@ -439,9 +444,9 @@ void handleArqTimeouts() {
                 sendRawPacket(compBuf, compLen, crc);
             } else {
                 isWaitingForAck = false;
-                Serial.println(F("\n" CLR_RED "********************************************************" CLR_RESET));
-                Serial.println(F(CLR_BOLD CLR_RED ">>> [ДОСТАВКА НЕ УДАЛАСЬ]: Луч перекрыт или нет связи! ❌" CLR_RESET));
-                Serial.println(F(CLR_RED "********************************************************\n" CLR_RESET));
+                Serial.println(F("\n********************************************************"));
+                Serial.println(F(">>> [ДОСТАВКА НЕ УДАЛАСЬ]: Луч перекрыт или нет связи! ❌"));
+                Serial.println(F("********************************************************\n"));
             }
         }
     }
@@ -613,45 +618,49 @@ void updateRxEngine() {
 // ОБРАБОТКА ПРИНЯТОГО БАЙТА
 // ============================================================================
 void processReceivedByte(uint8_t byteVal) {
+    // 1. Служебный байт PING REQUEST -> мгновенный ответ
     if (byteVal == Config::CTRL_PING_REQ) {
         sendPingResponse();
         return;
     }
 
+    // 2. Служебный байт PING RESPONSE -> фиксация RTT
     if (byteVal == Config::CTRL_PING_RESP) {
         if (isWaitingForPingReply) {
             isWaitingForPingReply = false;
             uint32_t rttMs = millis() - pingStartTimeMs;
             Serial.println();
-            Serial.println(F("\n" CLR_GREEN "========================================================" CLR_RESET));
-            Serial.println(F(CLR_BOLD CLR_GREEN ">>> [OPTICAL PING]: ОТВЕТ ПОЛУЧЕН! ✔" CLR_RESET));
-            Serial.print(F(CLR_WHITE "    • RTT (Круговая задержка): " CLR_BOLD CLR_YELLOW));
+            Serial.println(F("\n========================================================"));
+            Serial.println(F(">>> [OPTICAL PING]: ОТВЕТ ПОЛУЧЕН! ✔"));
+            Serial.print(F("    • RTT (Круговая задержка): "));
             Serial.print(rttMs);
-            Serial.println(F(" мс" CLR_RESET));
-            Serial.println(F(CLR_GREEN "    • Статус оптического луча: СВЯЗЬ АКТИВНА И СТАБИЛЬНА" CLR_RESET));
-            Serial.println(F(CLR_GREEN "========================================================\n" CLR_RESET));
+            Serial.println(F(" мс"));
+            Serial.println(F("    • Статус оптического луча: СВЯЗЬ АКТИВНА И СТАБИЛЬНА"));
+            Serial.println(F("========================================================\n"));
         }
         return;
     }
 
+    // 3. Служебный байт ACK
     if (byteVal == Config::CTRL_ACK) {
         if (isWaitingForAck) {
             isWaitingForAck = false;
             uint32_t rttMs = millis() - ackWaitStartTimeMs;
             Serial.println();
-            Serial.println(F("\n" CLR_MAGENTA "========================================================" CLR_RESET));
-            Serial.print(F(CLR_BOLD CLR_GREEN ">>> [СТАТУС ДОСТАВКИ]: ПАКЕТ ДОСТАВЛЕН ПОЛУЧАТЕЛЮ! ✔\n" CLR_RESET));
-            Serial.print(F(CLR_WHITE ">>> [АРВ-ПОДТВЕРЖДЕНИЕ]: Получен ACK за " CLR_YELLOW));
+            Serial.println(F("\n========================================================"));
+            Serial.print(F(">>> [СТАТУС ДОСТАВКИ]: ПАКЕТ ДОСТАВЛЕН ПОЛУЧАТЕЛЮ! ✔\n"));
+            Serial.print(F(">>> [АРВ-ПОДТВЕРЖДЕНИЕ]: Получен ACK за "));
             Serial.print(rttMs / 1000.0f, 2);
-            Serial.println(F(" сек (Целостность 100%)" CLR_RESET));
-            Serial.println(F(CLR_MAGENTA "========================================================\n" CLR_RESET));
+            Serial.println(F(" сек"));
+            Serial.println(F("========================================================\n"));
         }
         return;
     }
 
+    // 4. Служебный байт NAK
     if (byteVal == Config::CTRL_NAK) {
         if (isWaitingForAck) {
-            Serial.println(F("\n" CLR_RED ">>> [ARQ]: Получен NAK! Мгновенный повтор..." CLR_RESET));
+            Serial.println(F("\n>>> [ARQ]: Получен NAK! Мгновенный повтор..."));
             ackWaitStartTimeMs = 0;
         }
         return;
@@ -665,16 +674,19 @@ void processReceivedByte(uint8_t byteVal) {
     }
     rxLastCharTimeMs = millis();
 
+    // 5. Ожидание контрольного байта CRC-8
     if (rxPacketState == RxPacketState::WAIT_CRC) {
         finalizeReceivedMessage(true, byteVal);
         return;
     }
 
+    // 6. Маркер окончания текста
     if (byteVal == '\n' || byteVal == '\r') {
         rxPacketState = RxPacketState::WAIT_CRC;
         return;
     }
 
+    // Сохраняем сырой байт в буфер для последующей распаковки
     if (rxRawIndex < Config::RX_BUFFER_SIZE - 1) {
         rxRawBuffer[rxRawIndex++] = byteVal;
     }
@@ -689,8 +701,10 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
 
     if (rxRawIndex == 0) return;
 
+    // Расчет CRC-8 от принятого сжатого пакета
     uint8_t calculatedCRC = calculateCRC8(rxRawBuffer, rxRawIndex);
 
+    // Распаковываем текст обратно в UTF-8
     char decompressedText[Config::RX_BUFFER_SIZE * 2];
     size_t decompressedLen = decompressPayload(rxRawBuffer, rxRawIndex, decompressedText, sizeof(decompressedText));
 
@@ -711,66 +725,67 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
     }
 
     Serial.println();
-    Serial.println(F("\n" CLR_GREEN "************************************************************" CLR_RESET));
-    Serial.print(F(CLR_WHITE ">>> [RX: ПРИНЯТОЕ СООБЩЕНИЕ]: " CLR_BOLD CLR_GREEN "\""));
+    Serial.println(F("\n************************************************************"));
+    Serial.print(F(">>> [RX: ПРИНЯТОЕ СООБЩЕНИЕ]: \""));
     Serial.print(decompressedText);
-    Serial.println(F("\"" CLR_RESET));
-    Serial.print(F(CLR_WHITE ">>> [РАЗМЕР СООБЩЕНИЯ]:       " CLR_YELLOW));
+    Serial.println(F("\""));
+    Serial.print(F(">>> [РАЗМЕР СООБЩЕНИЯ]:       "));
     Serial.print(decompressedLen);
-    Serial.print(F(CLR_WHITE " байт (В луче передано: " CLR_MAGENTA));
+    Serial.print(F(" байт (В луче передано: "));
     Serial.print(rxRawIndex);
-    Serial.println(F(" байт) 🗜️" CLR_RESET));
+    Serial.println(F(" байт) 🗜️"));
 
     bool isCrcValid = false;
 
     if (hasCRC) {
-        Serial.print(F(CLR_WHITE ">>> [КОНТРОЛЬ CRC-8]:          Расчетный = " CLR_YELLOW "0x"));
+        Serial.print(F(">>> [КОНТРОЛЬ CRC-8]:          Расчетный = 0x"));
         if (calculatedCRC < 16) Serial.print(F("0"));
         Serial.print(calculatedCRC, HEX);
-        Serial.print(F(CLR_WHITE " | Принятый = " CLR_YELLOW "0x"));
+        Serial.print(F(" | Принятый = 0x"));
         if (receivedCRC < 16) Serial.print(F("0"));
         Serial.println(receivedCRC, HEX);
 
         if (calculatedCRC == receivedCRC) {
-            Serial.println(F(CLR_BOLD CLR_GREEN ">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [УСПЕШНО - ОШИБОК НЕТ!] ✔" CLR_RESET));
+            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [УСПЕШНО - ОШИБОК НЕТ!] ✔"));
             isCrcValid = true;
         } else {
-            Serial.println(F(CLR_BOLD CLR_RED ">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [ОШИБКА CRC! ДАННЫЕ ИСКАЖЕНЫ] ❌" CLR_RESET));
+            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [ОШИБКА CRC! ДАННЫЕ ИСКАЖЕНЫ] ❌"));
         }
     } else {
-        Serial.print(F(CLR_RED ">>> [КОНТРОЛЬ CRC-8]:          Таймаут CRC (Расчет: 0x"));
+        Serial.print(F(">>> [КОНТРОЛЬ CRC-8]:          Таймаут CRC (Расчет: 0x"));
         if (calculatedCRC < 16) Serial.print(F("0"));
         Serial.print(calculatedCRC, HEX);
-        Serial.println(F(")" CLR_RESET));
+        Serial.println(F(")"));
     }
 
-    Serial.println(F(CLR_CYAN "------------------------------------------------------------" CLR_RESET));
-    Serial.println(F(CLR_BOLD CLR_CYAN ">>> [МЕТРИКИ ОПТИЧЕСКОГО КАНАЛА LI-FI]:" CLR_RESET));
-    Serial.print(F(CLR_WHITE "    • Оптический контраст (ΔV): " CLR_YELLOW));
+    // ТЕЛЕМЕТРИЯ КАНАЛА
+    Serial.println(F("------------------------------------------------------------"));
+    Serial.println(F(">>> [МЕТРИКИ ОПТИЧЕСКОГО КАНАЛА LI-FI]:"));
+    Serial.print(F("    • Оптический контраст (ΔV): "));
     Serial.print(contrastDelta);
-    Serial.print(F(CLR_WHITE " ADC (Луч: " CLR_YELLOW));
+    Serial.print(F(" ADC (Луч: "));
     Serial.print(avgLightAdc);
-    Serial.print(F(CLR_WHITE " | Фон: " CLR_WHITE));
+    Serial.print(F(" | Фон: "));
     Serial.print(ambientNoiseLevel);
-    Serial.println(F(")" CLR_RESET));
+    Serial.println(F(")"));
 
-    Serial.print(F(CLR_WHITE "    • SNR (Сигнал/Шум):         " CLR_YELLOW));
+    Serial.print(F("    • SNR (Сигнал/Шум):         "));
     Serial.print(snrDb, 1);
     Serial.print(F(" dB "));
     if (snrDb >= 25.0f) {
-        Serial.println(F(CLR_GREEN "[ОТЛИЧНЫЙ СИГНАЛ] ★★★" CLR_RESET));
+        Serial.println(F("[ОТЛИЧНЫЙ СИГНАЛ] ★★★"));
     } else if (snrDb >= 16.0f) {
-        Serial.println(F(CLR_YELLOW "[ХОРОШИЙ СИГНАЛ] ★★☆" CLR_RESET));
+        Serial.println(F("[ХОРОШИЙ СИГНАЛ] ★★☆"));
     } else {
-        Serial.println(F(CLR_RED "[СЛАБЫЙ СИГНАЛ] ☆☆☆" CLR_RESET));
+        Serial.println(F("[СЛАБЫЙ СИГНАЛ] ☆☆☆"));
     }
 
-    Serial.print(F(CLR_WHITE "    • Эффективная скорость:     " CLR_YELLOW));
+    Serial.print(F("    • Эффективная скорость:     "));
     Serial.print(bytesPerSec, 1);
-    Serial.print(F(" байт/с (" CLR_YELLOW));
+    Serial.print(F(" байт/с ("));
     Serial.print(bitsPerSec, 1);
-    Serial.println(F(" бит/с)" CLR_RESET));
-    Serial.println(F(CLR_GREEN "************************************************************\n" CLR_RESET));
+    Serial.println(F(" бит/с)"));
+    Serial.println(F("************************************************************\n"));
 
     if (isCrcValid) {
         sendAckFrame(Config::CTRL_ACK);
@@ -781,9 +796,9 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
     rxRawIndex = 0;
 }
 
-// ============================================================================
+// ==========================================
 // КАЛИБРОВКА ТЕМНОТЫ
-// ============================================================================
+// ==========================================
 void calibrateDarkness() {
     long sum = 0;
     constexpr int SAMPLES = 60;
@@ -799,7 +814,7 @@ void calibrateDarkness() {
     ambientNoiseLevel = sum / SAMPLES;
     dynamicThreshold = ambientNoiseLevel + 25;
 
-    Serial.print(F(CLR_CYAN "[КАЛИБРОВКА] Фоновая темнота: " CLR_WHITE));
+    Serial.print(F("[КАЛИБРОВКА] Фоновая темнота: "));
     Serial.print(ambientNoiseLevel);
-    Serial.println(F(" (ADC 0..1023)\n" CLR_RESET));
+    Serial.println(F(" (ADC 0..1023)\n"));
 }
