@@ -1,24 +1,21 @@
 /*
  * ============================================================================
  * ПРОЕКТ: Li-Fi Полнодуплексная оптическая связь (Visible Light Communication)
- * МОДУЛЬ: ТРАНСИВЕР (FULL-DUPLEX + ПРОТОКОЛ ARQ / ACK + ЗВУКОВАЯ ТЕЛЕМЕТРИЯ)
+ * МОДУЛЬ: ТРАНСИВЕР (FULL-DUPLEX + PING + СЖАТИЕ ТЕКСТА + БЫСТРЫЙ ARQ)
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * 
  * АППАРАТНАЯ КОНФИГУРАЦИЯ:
  *   - TX (Передатчик):  LED на Pin 13 (через резистор 150-220 Ом на GND)
  *   - RX (Приемник):    Фотодиод BPW24 на Pin A0 (Катод -> 5V, Анод -> A0, Резистор -> GND)
- *   - BUZZER (Звук):    Пьезодинамик / Зуммер на Pin 8 (Плюс -> Pin 8, Минус -> GND)
  *   - Связь с ПК:       Hardware Serial UART (115200 baud)
  * 
- * НОВЫЕ ВОЗМОЖНОСТИ В ЭТОЙ ВЕРСИИ:
- *   1. Протокол гарантированной доставки ARQ (ACK / NAK / Auto-Retransmit):
- *      - Автоматическое оптическое подтверждение доставки (ACK).
- *      - Автоматический повтор отправки при помехах или перекрытии луча (до 3 попыток).
- *   2. Звуковая индикация событий (Buzzer):
- *      - Приятный аккорд при подтверждении доставки (ACK).
- *      - Звуковой отклик на входящие сообщения и отправку.
- *      - Тревожный сигнал при обнаружении искажений CRC-8.
- *   3. Полнодуплексный неблокирующий движок (Zero CPU Delay).
+ * НОВЫЕ ВОЗМОЖНОСТИ:
+ *   1. Оптический Ping (команда 'ping'):
+ *      - Замеряет точное время отклика (RTT в мс) по лучу Li-Fi.
+ *   2. Сжатие текста (Li-Fi Lossless Compression):
+ *      - Сжимает русские буквы UTF-8 в 2 раза (убирает избыточные префиксы 0xD0/0xD1).
+ *      - Передача русских фраз становится в 2 раза быстрее!
+ *   3. Полнодуплексный неблокирующий движок (45 бод, быстрый ARQ).
  * ============================================================================
  */
 
@@ -30,52 +27,29 @@
 namespace Config {
     constexpr uint8_t PIN_TX = 13;                         // Оптический передатчик (LED)
     constexpr uint8_t PIN_RX = A0;                         // Оптический приемник (Фотодиод)
-    constexpr uint8_t PIN_BUZZER = 8;                      // Зуммер / Пьезодинамик (опционально)
 
-    constexpr uint16_t BAUD_RATE = 30;                     // Скорость: 30 бит/с
-    constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс (1 бит)
-    constexpr uint32_t GUARD_PERIOD_US = BIT_PERIOD_US;    // 33 333 мкс (пауза между байтами)
+    // Скорость: 45 бод (22.2 мс на бит)
+    constexpr uint16_t BAUD_RATE = 45;
+    constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 22 222 мкс
+    constexpr uint32_t GUARD_PERIOD_US = 3000;             // Защитная пауза: 3 мс
 
     constexpr size_t TX_QUEUE_SIZE = 256;                  // Размер очереди TX
     constexpr size_t RX_BUFFER_SIZE = 256;                 // Размер буфера RX
-    constexpr uint32_t MESSAGE_TIMEOUT_MS = 500;           // Таймаут тишины окончания фразы
+    constexpr uint32_t MESSAGE_TIMEOUT_MS = 300;           // Таймаут тишины: 300 мс
 
-    constexpr int TRIGGER_MARGIN = 12;                     // Порог старт-триггера над фоном
-    constexpr int MIN_SIGNAL_DELTA = 15;                   // Минимальная амплитуда луча
-    constexpr int32_t VOTING_OFFSETS_US[3] = {-2000, 0, 2000}; // 3X Оверсэмплинг
+    constexpr int TRIGGER_MARGIN = 10;                     // Порог старт-триггера
+    constexpr int MIN_SIGNAL_DELTA = 12;                   // Минимальная амплитуда луча
+    constexpr int32_t VOTING_OFFSETS_US[3] = {-1500, 0, 1500}; // 3X Оверсэмплинг
 
-    // Управляющие байты протокола ARQ
-    constexpr uint8_t CTRL_ACK = 0x06;                     // Байт подтверждения успешной доставки
-    constexpr uint8_t CTRL_NAK = 0x15;                     // Байт ошибки контрольной суммы
-    constexpr uint32_t ACK_TIMEOUT_MS = 3500;              // Таймаут ожидания подтверждения ACK
-    constexpr uint8_t MAX_RETRIES = 3;                     // Максимальное число автоповторов
-}
+    // Управляющие байты протокола ARQ и PING
+    constexpr uint8_t CTRL_ACK       = 0x06;               // Байт подтверждения ACK
+    constexpr uint8_t CTRL_NAK       = 0x15;               // Байт ошибки NAK
+    constexpr uint8_t CTRL_PING_REQ  = 0x05;               // Оптический Ping запрос (ENQ)
+    constexpr uint8_t CTRL_PING_RESP = 0x04;               // Оптический Ping ответ (EOT)
+    constexpr uint8_t FLAG_COMPRESSED = 0x01;              // Маркер сжатого пакета
 
-// ============================================================================
-// ЗВУКОВОЙ ДИСПЕТЧЕР (SOUND EFFECTS)
-// ============================================================================
-namespace Sound {
-    void playTxSent() {
-        tone(Config::PIN_BUZZER, 1200, 40);
-    }
-
-    void playRxReceived() {
-        tone(Config::PIN_BUZZER, 1500, 50);
-    }
-
-    void playAckConfirmed() {
-        tone(Config::PIN_BUZZER, 1400, 50);
-        delay(60);
-        tone(Config::PIN_BUZZER, 2100, 100);
-    }
-
-    void playCrcError() {
-        tone(Config::PIN_BUZZER, 350, 200);
-    }
-
-    void playRetryAlert() {
-        tone(Config::PIN_BUZZER, 800, 70);
-    }
+    constexpr uint32_t ACK_TIMEOUT_MS = 2500;              // Таймаут ожидания ACK
+    constexpr uint8_t MAX_RETRIES = 3;                     // Число повторов ARQ
 }
 
 // ============================================================================
@@ -137,7 +111,7 @@ enum class RxPacketState : uint8_t {
 };
 
 // ============================================================================
-// ПЕРЕМЕННЫЕ ПЕРЕДАТЧИКА И ARQ
+// ПЕРЕМЕННЫЕ ПЕРЕДАТЧИКА, ARQ И PING
 // ============================================================================
 TxState txState = TxState::IDLE;
 uint32_t txBitDeadlineUs = 0;
@@ -150,6 +124,10 @@ size_t lastSentMessageLen = 0;
 bool isWaitingForAck = false;
 uint32_t ackWaitStartTimeMs = 0;
 uint8_t currentRetryCount = 0;
+
+// Переменные PING
+bool isWaitingForPingReply = false;
+uint32_t pingStartTimeMs = 0;
 
 // ============================================================================
 // ПЕРЕМЕННЫЕ ПРИЕМНИКА (RX ENGINE)
@@ -166,10 +144,10 @@ uint8_t rxHighVotesCount = 0;
 int ambientNoiseLevel = 3;                                 // Фоновая темнота
 int dynamicThreshold = 35;                                // Адаптивный порог
 int peakLightAdc = 150;                                   // Пик света старт-бита
-int hysteresisVal = 8;
+int hysteresisVal = 6;
 
-char rxSentenceBuffer[Config::RX_BUFFER_SIZE];
-size_t rxBufferIndex = 0;
+uint8_t rxRawBuffer[Config::RX_BUFFER_SIZE];
+size_t rxRawIndex = 0;
 uint32_t rxLastCharTimeMs = 0;
 uint32_t rxMessageStartTimeMs = 0;
 bool rxIsReceivingMessage = false;
@@ -181,12 +159,17 @@ int lightSamplesCount = 0;
 // ПРОТОТИПЫ
 // ============================================================================
 uint8_t calculateCRC8(const uint8_t* data, size_t len);
+size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxDstLen);
+size_t decompressPayload(const uint8_t* src, size_t srcLen, char* dst, size_t maxDstLen);
+
 void updateTxEngine();
 void updateRxEngine();
 void handleSerialInput();
 void handleArqTimeouts();
-void sendRawPacket(const char* text, size_t len);
+void sendRawPacket(const uint8_t* payload, size_t len, uint8_t crc);
 void sendAckFrame(uint8_t controlByte);
+void sendPingRequest();
+void sendPingResponse();
 void calibrateDarkness();
 void processReceivedByte(uint8_t byteVal);
 void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC);
@@ -199,55 +182,116 @@ void setup() {
     digitalWrite(Config::PIN_TX, LOW);
 
     pinMode(Config::PIN_RX, INPUT);
-    pinMode(Config::PIN_BUZZER, OUTPUT);
 
     Serial.begin(115200);
-    delay(500);
+    delay(400);
 
     Serial.println(F("\n============================================================"));
-    Serial.println(F("  >>> Li-Fi ТРАНСИВЕР [FULL-DUPLEX + ПРОТОКОЛ ARQ/ACK] <<<  "));
+    Serial.println(F(" >>> Li-Fi ТРАНСИВЕР [FULL-DUPLEX + PING + СЖАТИЕ + ARQ] <<< "));
     Serial.println(F("============================================================"));
     Serial.print(F("[INFO] Скорость Li-Fi:        "));
     Serial.print(Config::BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(Config::BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
+    Serial.println(F("[INFO] Сжатие данных:          ВКЛЮЧЕНО (Ускорение кириллицы x2)"));
+    Serial.println(F("[INFO] Оптический Ping:        ВКЛЮЧЕНО (Команда 'ping')"));
     Serial.println(F("[INFO] Режим связи:            FULL-DUPLEX (Одновременный TX/RX)"));
-    Serial.println(F("[INFO] Гарантия доставки:      Протокол ARQ (ACK / NAK / Auto-Retransmit)"));
-    Serial.println(F("[INFO] Звуковая индикация:     Пьезодинамик на Pin 8"));
-    Serial.println(F("[INFO] Поддержка языков:       UTF-8 Русский + English + CRC-8"));
 
     calibrateDarkness();
 
-    // Приветственный звуковой сигнал готовности
-    tone(Config::PIN_BUZZER, 1000, 80);
-    delay(100);
-    tone(Config::PIN_BUZZER, 1500, 100);
-
     Serial.println(F("------------------------------------------------------------"));
-    Serial.println(F("Трансивер готов к надежной связи с подтверждением доставки!\n"));
+    Serial.println(F("Команды:"));
+    Serial.println(F("  - Введите текст для отправки"));
+    Serial.println(F("  - 'ping' - измерить круговую задержку луча (RTT)"));
+    Serial.println(F("  - 'c' - калибровка темноты, 'r' - замер АЦП"));
+    Serial.println(F("------------------------------------------------------------\n"));
 }
 
 // ============================================================================
 // ГЛАВНЫЙ ЦИКЛ (LOOP)
 // ============================================================================
 void loop() {
-    // 1. Опрос ввода с ПК
     handleSerialInput();
-
-    // 2. Шаг автомата передатчика (TX)
     updateTxEngine();
-
-    // 3. Шаг автомата приемника (RX)
     updateRxEngine();
 
-    // 4. Проверка таймаута тишины завершения входящего сообщения
     if (rxIsReceivingMessage && (millis() - rxLastCharTimeMs > Config::MESSAGE_TIMEOUT_MS)) {
         finalizeReceivedMessage(false, 0);
     }
 
-    // 5. Проверка таймаутов протокола ARQ (ожидание подтверждения ACK / автоповтор)
     handleArqTimeouts();
+}
+
+// ============================================================================
+// АЛГОРИТМ БЫСТРОГО СЖАТИЯ (КИРИЛЛИЦА UTF-8 PACKING)
+// ============================================================================
+
+/**
+ * @brief Сжатие UTF-8 текста: убирает повторяющиеся префиксы 0xD0/0xD1
+ * Сжимает русские слова ровно в 2 раза!
+ */
+size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxDstLen) {
+    if (maxDstLen < 2) return 0;
+    
+    // Первый байт - флаг сжатия
+    dst[0] = Config::FLAG_COMPRESSED;
+    size_t dIdx = 1;
+
+    for (size_t i = 0; i < srcLen && dIdx < maxDstLen - 1; i++) {
+        uint8_t c1 = static_cast<uint8_t>(src[i]);
+
+        if (c1 == 0xD0 && i + 1 < srcLen) {
+            uint8_t c2 = static_cast<uint8_t>(src[i + 1]);
+            if (c2 >= 0x80 && c2 <= 0xBF) {
+                // Сжимаем пару 0xD0 + c2 в один токен (0x80..0xBF)
+                dst[dIdx++] = c2;
+                i++;
+                continue;
+            }
+        } else if (c1 == 0xD1 && i + 1 < srcLen) {
+            uint8_t c2 = static_cast<uint8_t>(src[i + 1]);
+            if (c2 >= 0x80 && c2 <= 0xBF) {
+                // Сжимаем пару 0xD1 + c2 в один токен (0xC0..0xFF)
+                dst[dIdx++] = (c2 + 0x40);
+                i++;
+                continue;
+            }
+        }
+
+        dst[dIdx++] = c1;
+    }
+
+    return dIdx;
+}
+
+/**
+ * @brief Распаковка сжатого потока обратно в чистый UTF-8
+ */
+size_t decompressPayload(const uint8_t* src, size_t srcLen, char* dst, size_t maxDstLen) {
+    if (srcLen == 0 || maxDstLen == 0) return 0;
+
+    size_t dIdx = 0;
+    size_t sIdx = (src[0] == Config::FLAG_COMPRESSED) ? 1 : 0;
+
+    while (sIdx < srcLen && dIdx < maxDstLen - 2) {
+        uint8_t b = src[sIdx++];
+
+        if (b >= 0x80 && b <= 0xBF) {
+            // Восстанавливаем префикс 0xD0
+            dst[dIdx++] = static_cast<char>(0xD0);
+            dst[dIdx++] = static_cast<char>(b);
+        } else if (b >= 0xC0 && b <= 0xFF) {
+            // Восстанавливаем префикс 0xD1
+            dst[dIdx++] = static_cast<char>(0xD1);
+            dst[dIdx++] = static_cast<char>(b - 0x40);
+        } else {
+            dst[dIdx++] = static_cast<char>(b);
+        }
+    }
+
+    dst[dIdx] = '\0';
+    return dIdx;
 }
 
 // ============================================================================
@@ -269,29 +313,34 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 }
 
 // ============================================================================
-// ПРОТОКОЛ ARQ: ОТПРАВКА И УПРАВЛЕНИЕ ДОСТАВКОЙ
+// ОТПРАВКА, PING И ARQ
 // ============================================================================
 
-void sendRawPacket(const char* text, size_t len) {
-    uint8_t crc = calculateCRC8(reinterpret_cast<const uint8_t*>(text), len);
-
-    // 1. Помещаем байты текста
+void sendRawPacket(const uint8_t* payload, size_t len, uint8_t crc) {
     for (size_t i = 0; i < len; i++) {
-        txQueue.push(static_cast<uint8_t>(text[i]));
+        txQueue.push(payload[i]);
     }
-    // 2. Маркер окончания строки
     txQueue.push('\n');
-    // 3. Байт CRC-8
     txQueue.push(crc);
-
-    Sound::playTxSent();
 }
 
 void sendAckFrame(uint8_t controlByte) {
-    // Служебный пакет подтверждения: байт управления + маркер
     txQueue.push(controlByte);
-    txQueue.push('\n');
-    txQueue.push(controlByte); // CRC для служебного кадра
+}
+
+void sendPingRequest() {
+    isWaitingForPingReply = true;
+    pingStartTimeMs = millis();
+
+    Serial.println(F("\n========================================================"));
+    Serial.println(F(">>> [OPTICAL PING]: Отправка эхо-запроса по лучу Li-Fi..."));
+    Serial.println(F("========================================================"));
+
+    txQueue.push(Config::CTRL_PING_REQ);
+}
+
+void sendPingResponse() {
+    txQueue.push(Config::CTRL_PING_RESP);
 }
 
 void handleSerialInput() {
@@ -300,7 +349,13 @@ void handleSerialInput() {
         input.trim();
 
         if (input.length() > 0) {
-            // Быстрые служебные команды
+            // Команда PING
+            if (input.equalsIgnoreCase("ping")) {
+                sendPingRequest();
+                return;
+            }
+
+            // Служебные команды
             if (input.length() == 1) {
                 char cmd = input.charAt(0);
                 if (cmd == 'c' || cmd == 'C') {
@@ -318,61 +373,80 @@ void handleSerialInput() {
                 }
             }
 
-            // Сохраняем сообщение в буфер ARQ для возможного автоповтора
             size_t copyLen = min(input.length(), sizeof(lastSentMessage) - 1);
             memcpy(lastSentMessage, input.c_str(), copyLen);
             lastSentMessage[copyLen] = '\0';
             lastSentMessageLen = copyLen;
 
+            // Сжимаем текст перед отправкой
+            uint8_t compBuf[Config::TX_QUEUE_SIZE];
+            size_t compLen = compressPayload(lastSentMessage, lastSentMessageLen, compBuf, sizeof(compBuf));
+
+            uint8_t crc = calculateCRC8(compBuf, compLen);
+
             isWaitingForAck = true;
             ackWaitStartTimeMs = millis();
             currentRetryCount = 0;
 
-            uint8_t crc = calculateCRC8(reinterpret_cast<const uint8_t*>(lastSentMessage), lastSentMessageLen);
-
             Serial.println(F("\n>>>>>>>>>>>>>> [ TX: ОТПРАВКА СООБЩЕНИЯ ] >>>>>>>>>>>>>>"));
-            Serial.print(F("[TX Текст]:    \""));
+            Serial.print(F("[TX Текст]:     \""));
             Serial.print(lastSentMessage);
             Serial.println(F("\""));
-            Serial.print(F("[TX Объем]:    "));
+            Serial.print(F("[TX Сжатие]:    Исходный: "));
             Serial.print(lastSentMessageLen);
-            Serial.print(F(" байт | CRC-8: 0x"));
+            Serial.print(F(" байт -> В луче: "));
+            Serial.print(compLen);
+            Serial.print(F(" байт (Экономия: "));
+            int saved = 100 - (int)((compLen * 100) / lastSentMessageLen);
+            Serial.print(max(0, saved));
+            Serial.println(F("%) 🗜️"));
+            Serial.print(F("[TX CRC-8]:     0x"));
             if (crc < 16) Serial.print(F("0"));
             Serial.println(crc, HEX);
-            Serial.println(F("[TX Статус]:   Ожидание подтверждения доставки (ACK)..."));
+            Serial.println(F("[TX Статус]:    Ожидание подтверждения доставки (ACK)..."));
             Serial.println(F("--------------------------------------------------------"));
 
-            // Отправляем пакет в оптический канал
-            sendRawPacket(lastSentMessage, lastSentMessageLen);
+            sendRawPacket(compBuf, compLen, crc);
         }
     }
 }
 
 void handleArqTimeouts() {
+    // 1. Проверка таймаута PING
+    if (isWaitingForPingReply && txQueue.isEmpty() && txState == TxState::IDLE) {
+        if (millis() - pingStartTimeMs > 2000) {
+            isWaitingForPingReply = false;
+            Serial.println(F("\n********************************************************"));
+            Serial.println(F(">>> [OPTICAL PING]: Таймаут ответа! Луч не дошел до цели ❌"));
+            Serial.println(F("********************************************************\n"));
+        }
+    }
+
+    // 2. Проверка таймаута ARQ
     if (isWaitingForAck && txQueue.isEmpty() && txState == TxState::IDLE) {
         if (millis() - ackWaitStartTimeMs > Config::ACK_TIMEOUT_MS) {
-            // Время ожидания ACK истекло
             if (currentRetryCount < Config::MAX_RETRIES) {
                 currentRetryCount++;
                 ackWaitStartTimeMs = millis();
 
                 Serial.println(F("\n--------------------------------------------------------"));
-                Serial.print(F(">>> [ARQ АВТОПОВТОР]: Таймаут ответа. Повторная отправка пакета (Попытка "));
+                Serial.print(F(">>> [ARQ АВТОПОВТОР]: Таймаут. Повтор пакета (Попытка "));
                 Serial.print(currentRetryCount);
                 Serial.print(F(" из "));
                 Serial.print(Config::MAX_RETRIES);
                 Serial.println(F(")... 🔄"));
                 Serial.println(F("--------------------------------------------------------"));
 
-                Sound::playRetryAlert();
-                sendRawPacket(lastSentMessage, lastSentMessageLen);
+                uint8_t compBuf[Config::TX_QUEUE_SIZE];
+                size_t compLen = compressPayload(lastSentMessage, lastSentMessageLen, compBuf, sizeof(compBuf));
+                uint8_t crc = calculateCRC8(compBuf, compLen);
+
+                sendRawPacket(compBuf, compLen, crc);
             } else {
-                // Превышен лимит попыток
                 isWaitingForAck = false;
                 Serial.println(F("\n********************************************************"));
                 Serial.println(F(">>> [ДОСТАВКА НЕ УДАЛАСЬ]: Луч перекрыт или нет связи! ❌"));
                 Serial.println(F("********************************************************\n"));
-                Sound::playCrcError();
             }
         }
     }
@@ -544,7 +618,30 @@ void updateRxEngine() {
 // ОБРАБОТКА ПРИНЯТОГО БАЙТА
 // ============================================================================
 void processReceivedByte(uint8_t byteVal) {
-    // Перехват служебных пакетов подтверждения ARQ (ACK / NAK)
+    // 1. Служебный байт PING REQUEST -> мгновенный ответ
+    if (byteVal == Config::CTRL_PING_REQ) {
+        sendPingResponse();
+        return;
+    }
+
+    // 2. Служебный байт PING RESPONSE -> фиксация RTT
+    if (byteVal == Config::CTRL_PING_RESP) {
+        if (isWaitingForPingReply) {
+            isWaitingForPingReply = false;
+            uint32_t rttMs = millis() - pingStartTimeMs;
+            Serial.println();
+            Serial.println(F("\n========================================================"));
+            Serial.println(F(">>> [OPTICAL PING]: ОТВЕТ ПОЛУЧЕН! ✔"));
+            Serial.print(F("    • RTT (Круговая задержка): "));
+            Serial.print(rttMs);
+            Serial.println(F(" мс"));
+            Serial.println(F("    • Статус оптического луча: СВЯЗЬ АКТИВНА И СТАБИЛЬНА"));
+            Serial.println(F("========================================================\n"));
+        }
+        return;
+    }
+
+    // 3. Служебный байт ACK
     if (byteVal == Config::CTRL_ACK) {
         if (isWaitingForAck) {
             isWaitingForAck = false;
@@ -554,15 +651,16 @@ void processReceivedByte(uint8_t byteVal) {
             Serial.print(F(">>> [СТАТУС ДОСТАВКИ]: ПАКЕТ ДОСТАВЛЕН ПОЛУЧАТЕЛЮ! ✔\n"));
             Serial.print(F(">>> [АРВ-ПОДТВЕРЖДЕНИЕ]: Получен ACK за "));
             Serial.print(rttMs / 1000.0f, 2);
-            Serial.println(F(" сек (Целостность 100%)"));
+            Serial.println(F(" сек"));
             Serial.println(F("========================================================\n"));
-            Sound::playAckConfirmed();
         }
         return;
-    } else if (byteVal == Config::CTRL_NAK) {
+    }
+
+    // 4. Служебный байт NAK
+    if (byteVal == Config::CTRL_NAK) {
         if (isWaitingForAck) {
-            Serial.println(F("\n>>> [ARQ]: Получен сигнал ошибки (NAK) от собеседника! Запуск повтора..."));
-            // Принудительно запускаем таймаут для мгновенного повтора
+            Serial.println(F("\n>>> [ARQ]: Получен NAK! Мгновенный повтор..."));
             ackWaitStartTimeMs = 0;
         }
         return;
@@ -576,26 +674,21 @@ void processReceivedByte(uint8_t byteVal) {
     }
     rxLastCharTimeMs = millis();
 
-    // 1. Ожидание контрольного байта CRC-8
+    // 5. Ожидание контрольного байта CRC-8
     if (rxPacketState == RxPacketState::WAIT_CRC) {
         finalizeReceivedMessage(true, byteVal);
         return;
     }
 
-    // 2. Маркер окончания текста
+    // 6. Маркер окончания текста
     if (byteVal == '\n' || byteVal == '\r') {
         rxPacketState = RxPacketState::WAIT_CRC;
         return;
     }
 
-    // 3. Вывод символа (ASCII + UTF-8 Русские буквы)
-    if (byteVal >= 32 && byteVal != 127) {
-        Serial.write(byteVal);
-
-        if (rxBufferIndex < Config::RX_BUFFER_SIZE - 1) {
-            rxSentenceBuffer[rxBufferIndex++] = static_cast<char>(byteVal);
-            rxSentenceBuffer[rxBufferIndex] = '\0';
-        }
+    // Сохраняем сырой байт в буфер для последующей распаковки
+    if (rxRawIndex < Config::RX_BUFFER_SIZE - 1) {
+        rxRawBuffer[rxRawIndex++] = byteVal;
     }
 }
 
@@ -606,13 +699,20 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
     rxIsReceivingMessage = false;
     rxPacketState = RxPacketState::PAYLOAD;
 
-    if (rxBufferIndex == 0) return;
+    if (rxRawIndex == 0) return;
 
-    uint32_t totalDurationMs = rxLastCharTimeMs - rxMessageStartTimeMs + 350;
-    if (totalDurationMs < 100) totalDurationMs = 100;
+    // Расчет CRC-8 от принятого сжатого пакета
+    uint8_t calculatedCRC = calculateCRC8(rxRawBuffer, rxRawIndex);
+
+    // Распаковываем текст обратно в UTF-8
+    char decompressedText[Config::RX_BUFFER_SIZE * 2];
+    size_t decompressedLen = decompressPayload(rxRawBuffer, rxRawIndex, decompressedText, sizeof(decompressedText));
+
+    uint32_t totalDurationMs = rxLastCharTimeMs - rxMessageStartTimeMs + 250;
+    if (totalDurationMs < 50) totalDurationMs = 50;
     float durationSec = totalDurationMs / 1000.0f;
 
-    float bytesPerSec = static_cast<float>(rxBufferIndex) / durationSec;
+    float bytesPerSec = static_cast<float>(decompressedLen) / durationSec;
     float bitsPerSec = bytesPerSec * 8.0f;
 
     int avgLightAdc = (lightSamplesCount > 0) ? static_cast<int>(totalLightAdcSum / lightSamplesCount) : peakLightAdc;
@@ -624,16 +724,16 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
         snrDb = 20.0f * log10(static_cast<float>(avgLightAdc) / static_cast<float>(noiseBase));
     }
 
-    uint8_t calculatedCRC = calculateCRC8(reinterpret_cast<const uint8_t*>(rxSentenceBuffer), rxBufferIndex);
-
     Serial.println();
     Serial.println(F("\n************************************************************"));
     Serial.print(F(">>> [RX: ПРИНЯТОЕ СООБЩЕНИЕ]: \""));
-    Serial.print(rxSentenceBuffer);
+    Serial.print(decompressedText);
     Serial.println(F("\""));
     Serial.print(F(">>> [РАЗМЕР СООБЩЕНИЯ]:       "));
-    Serial.print(rxBufferIndex);
-    Serial.println(F(" байт"));
+    Serial.print(decompressedLen);
+    Serial.print(F(" байт (В луче передано: "));
+    Serial.print(rxRawIndex);
+    Serial.println(F(" байт) 🗜️"));
 
     bool isCrcValid = false;
 
@@ -680,31 +780,25 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
         Serial.println(F("[СЛАБЫЙ СИГНАЛ] ☆☆☆"));
     }
 
-    Serial.print(F("    • Скорость передачи:        "));
+    Serial.print(F("    • Эффективная скорость:     "));
     Serial.print(bytesPerSec, 1);
     Serial.print(F(" байт/с ("));
     Serial.print(bitsPerSec, 1);
     Serial.println(F(" бит/с)"));
     Serial.println(F("************************************************************\n"));
 
-    // ОТВЕТНЫЙ СИГНАЛ ПО ПРОТОКОЛУ ARQ
     if (isCrcValid) {
-        // Отправляем оптический ACK обратно отправителю
         sendAckFrame(Config::CTRL_ACK);
-        Sound::playRxReceived();
     } else {
-        // Отправляем оптический NAK для запроса автоповтора
         sendAckFrame(Config::CTRL_NAK);
-        Sound::playCrcError();
     }
 
-    rxBufferIndex = 0;
-    rxSentenceBuffer[0] = '\0';
+    rxRawIndex = 0;
 }
 
-// ============================================================================
+// ==========================================
 // КАЛИБРОВКА ТЕМНОТЫ
-// ============================================================================
+// ==========================================
 void calibrateDarkness() {
     long sum = 0;
     constexpr int SAMPLES = 60;
