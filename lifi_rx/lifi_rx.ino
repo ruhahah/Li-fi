@@ -161,12 +161,12 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 
 bool checkStartTrigger() {
     int val = analogRead(RX_PIN);
-    return (val > (ambientNoiseLevel + 15));
+    return (val > (ambientNoiseLevel + 10));
 }
 
 bool sampleBitWithVoting(uint32_t bitCenterUs) {
     int highVotes = 0;
-    constexpr int32_t offsetsUs[3] = {-2000, 0, 2000};
+    constexpr int32_t offsetsUs[3] = {-1500, 0, 1500};
 
     for (int i = 0; i < 3; i++) {
         uint32_t sampleTimeUs = bitCenterUs + offsetsUs[i];
@@ -192,7 +192,7 @@ bool receiveByte(uint8_t& outByte) {
     while ((long)(micros() - startCenterUs) < 0);
 
     int startSample = analogRead(RX_PIN);
-    if (startSample <= (ambientNoiseLevel + 20)) {
+    if (startSample <= (ambientNoiseLevel + 15)) {
         return false; // Ложный шум
     }
 
@@ -222,18 +222,16 @@ bool receiveByte(uint8_t& outByte) {
     while ((long)(micros() - stopCenterUs) < 0);
 
     int stopAdc = analogRead(RX_PIN);
-    bool isStopValid = (stopAdc < thresholdValue);
+    // Для лазера: не сбрасываем весь байт из-за хвоста спада стоп-бита;
+    // CRC-8 гарантированно отфильтрует ошибки на уровне всего сообщения
+    bool isStopValid = (stopAdc < (thresholdValue + hysteresisVal));
 
     // Окончание кадра (+ 10.0 * T)
     uint32_t frameEndUs = frameStartUs + (BIT_PERIOD_US * 10);
     while ((long)(micros() - frameEndUs) < 0);
 
-    if (isStopValid) {
-        outByte = reconstructedByte;
-        return true;
-    }
-
-    return false;
+    outByte = reconstructedByte;
+    return true;
 }
 
 // ==========================================
@@ -413,12 +411,24 @@ void handleSerialCommands() {
             calibrateDarkness();
         } else if (cmd == 'r' || cmd == 'R') {
             int cur = analogRead(RX_PIN);
-            Serial.print(F("[АЦП]: "));
-            Serial.print(cur);
-            Serial.print(F(" | Фон: "));
-            Serial.print(ambientNoiseLevel);
-            Serial.print(F(" | Порог: "));
-            Serial.println(thresholdValue);
+            int delta = cur - ambientNoiseLevel;
+            Serial.println(F("\n--- [RX: ДИАГНОСТИКА СИГНАЛА АЦП A0] ---"));
+            Serial.print(F("Текущий уровень АЦП:  ")); Serial.println(cur);
+            Serial.print(F("Фоновая темнота:      ")); Serial.println(ambientNoiseLevel);
+            Serial.print(F("Амплитуда луча (ΔV):  ")); Serial.println(delta);
+            Serial.print(F("Порог срабатывания:   ")); Serial.println(ambientNoiseLevel + 10);
+            if (delta >= 15) {
+                Serial.println(F("СТАТУС: [СИГНАЛ В НОРМЕ] Луч уверенно регистрируется!"));
+            } else if (delta > 0) {
+                Serial.println(F("СТАТУС: [СЛАБЫЙ СИГНАЛ] Амплитуды недостаточно для надежного приема."));
+                Serial.println(F("СОВЕТ: Точнее направьте лазер в фотодиод или увеличьте резистор подтяжки (5-20 кОм)."));
+            } else if (delta < -20) {
+                Serial.println(F("СТАТУС: [ИНВЕРТИРОВАННАЯ ПОЛЯРНОСТЬ] При свете АЦП падает, а не растет!"));
+                Serial.println(F("СОВЕТ: Поменяйте выводы фотодиода (Катод -> 5V, Анод -> A0, Резистор -> GND)."));
+            } else {
+                Serial.println(F("СТАТУС: [НЕТ СИГНАЛА] Фотодиод не видит свет лазера."));
+            }
+            Serial.println(F("----------------------------------------\n"));
         }
     }
 }

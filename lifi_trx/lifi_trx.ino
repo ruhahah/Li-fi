@@ -27,20 +27,20 @@ namespace Config {
     constexpr uint8_t PIN_TX = 13;                         // Оптический передатчик: Лазер (KY-008)
     constexpr uint8_t PIN_RX = A0;                         // Оптический приемник: Фотодиод BPW24
 
-    // Скорость: 45 бод (22.2 мс на бит)
-    constexpr uint16_t BAUD_RATE = 45;
-    constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 22 222 мкс
-    // Защитная пауза: 5 мс (увеличена для лазера — чёткий спад импульса)
+    // Скорость: 30 бод (33.3 мс на бит) для идеальной стабильности и совместимости с lifi_tx/lifi_rx
+    constexpr uint16_t BAUD_RATE = 30;
+    constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
+    // Защитная пауза: 5 мс (для лазера — чистый спад импульса)
     constexpr uint32_t GUARD_PERIOD_US = 5000;
 
     constexpr size_t TX_QUEUE_SIZE = 256;                  // Размер очереди TX
     constexpr size_t RX_BUFFER_SIZE = 256;                 // Размер буфера RX
-    constexpr uint32_t MESSAGE_TIMEOUT_MS = 400;           // Таймаут тишины: 400 мс
+    constexpr uint32_t MESSAGE_TIMEOUT_MS = 500;           // Таймаут тишины: 500 мс
 
-    constexpr int TRIGGER_MARGIN = 15;                     // Порог старт-триггера лазерного импульса
-    constexpr int MIN_SIGNAL_DELTA = 20;                   // Минимальная амплитуда лазерного луча
-    // Оверсэмплинг ±800 мкс — уменьшен для лазера (быстрый фронт, нет нужды в широком окне)
-    constexpr int32_t VOTING_OFFSETS_US[3] = {-800, 0, 800};
+    constexpr int TRIGGER_MARGIN = 10;                     // Порог старт-триггера лазерного импульса
+    constexpr int MIN_SIGNAL_DELTA = 15;                   // Минимальная амплитуда лазерного луча
+    // Оверсэмплинг ±1200 мкс для 30 бод
+    constexpr int32_t VOTING_OFFSETS_US[3] = {-1200, 0, 1200};
 
     // Управляющие байты протокола ARQ и PING
     constexpr uint8_t CTRL_ACK       = 0x06;               // Байт подтверждения ACK
@@ -372,12 +372,24 @@ void handleSerialInput() {
                     return;
                 } else if (cmd == 'r' || cmd == 'R') {
                     int cur = analogRead(Config::PIN_RX);
-                    Serial.print(F("[АЦП]: "));
-                    Serial.print(cur);
-                    Serial.print(F(" | Фон: "));
-                    Serial.print(ambientNoiseLevel);
-                    Serial.print(F(" | Порог: "));
-                    Serial.println(dynamicThreshold);
+                    int delta = cur - ambientNoiseLevel;
+                    Serial.println(F("\n--- [ДИАГНОСТИКА СИГНАЛА АЦП A0] ---"));
+                    Serial.print(F("Текущий уровень АЦП:  ")); Serial.println(cur);
+                    Serial.print(F("Фоновая темнота:      ")); Serial.println(ambientNoiseLevel);
+                    Serial.print(F("Амплитуда луча (ΔV):  ")); Serial.println(delta);
+                    Serial.print(F("Порог срабатывания:   ")); Serial.println(ambientNoiseLevel + Config::TRIGGER_MARGIN);
+                    if (delta >= Config::MIN_SIGNAL_DELTA) {
+                        Serial.println(F("СТАТУС: [СИГНАЛ В НОРМЕ] Луч уверенно регистрируется!"));
+                    } else if (delta > 0) {
+                        Serial.println(F("СТАТУС: [СЛАБЫЙ СИГНАЛ] Амплитуды недостаточно для надежного приема."));
+                        Serial.println(F("СОВЕТ: Точнее направьте лазер в фотодиод или увеличьте резистор подтяжки (5-20 кОм)."));
+                    } else if (delta < -20) {
+                        Serial.println(F("СТАТУС: [ИНВЕРТИРОВАННАЯ ПОЛЯРНОСТЬ] При свете АЦП падает, а не растет!"));
+                        Serial.println(F("СОВЕТ: Поменяйте выводы фотодиода (Катод -> 5V, Анод -> A0, Резистор -> GND)."));
+                    } else {
+                        Serial.println(F("СТАТУС: [НЕТ СИГНАЛА] Фотодиод не видит свет лазера."));
+                    }
+                    Serial.println(F("------------------------------------\n"));
                     return;
                 }
             }
@@ -684,11 +696,16 @@ void processReceivedByte(uint8_t byteVal) {
         rxMessageStartTimeMs = millis();
         totalLightAdcSum = 0;
         lightSamplesCount = 0;
+        Serial.print(F("\n[RX]: Прием данных... "));
     }
     rxLastCharTimeMs = millis();
 
     // 5. Ожидание контрольного байта CRC-8
     if (rxPacketState == RxPacketState::WAIT_CRC) {
+        Serial.print(F(" [CRC: 0x"));
+        if (byteVal < 16) Serial.print(F("0"));
+        Serial.print(byteVal, HEX);
+        Serial.println(F("]"));
         finalizeReceivedMessage(true, byteVal);
         return;
     }
@@ -698,6 +715,9 @@ void processReceivedByte(uint8_t byteVal) {
         rxPacketState = RxPacketState::WAIT_CRC;
         return;
     }
+
+    // Выводим точку в консоль за каждый принятый байт
+    Serial.print(F("."));
 
     // Сохраняем сырой байт в буфер
     if (rxRawIndex < Config::RX_BUFFER_SIZE - 1) {
