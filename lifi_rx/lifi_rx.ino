@@ -161,7 +161,7 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 
 bool checkStartTrigger() {
     int val = analogRead(RX_PIN);
-    return (val > (ambientNoiseLevel + 10));
+    return (val >= thresholdValue);
 }
 
 bool sampleBitWithVoting(uint32_t bitCenterUs) {
@@ -192,7 +192,7 @@ bool receiveByte(uint8_t& outByte) {
     while ((long)(micros() - startCenterUs) < 0);
 
     int startSample = analogRead(RX_PIN);
-    if (startSample <= (ambientNoiseLevel + 15)) {
+    if (startSample < thresholdValue) {
         return false; // Ложный шум
     }
 
@@ -221,14 +221,13 @@ bool receiveByte(uint8_t& outByte) {
     uint32_t stopCenterUs = frameStartUs + (BIT_PERIOD_US * 19 / 2);
     while ((long)(micros() - stopCenterUs) < 0);
 
-    int stopAdc = analogRead(RX_PIN);
-    // Для лазера: не сбрасываем весь байт из-за хвоста спада стоп-бита;
-    // CRC-8 гарантированно отфильтрует ошибки на уровне всего сообщения
-    bool isStopValid = (stopAdc < (thresholdValue + hysteresisVal));
-
     // Окончание кадра (+ 10.0 * T)
     uint32_t frameEndUs = frameStartUs + (BIT_PERIOD_US * 10);
     while ((long)(micros() - frameEndUs) < 0);
+
+    // Ожидание темноты (спада хвоста импульса перед следующим байтом)
+    uint32_t waitDarkStart = micros();
+    while (analogRead(RX_PIN) >= thresholdValue && (micros() - waitDarkStart < BIT_PERIOD_US * 2));
 
     outByte = reconstructedByte;
     return true;

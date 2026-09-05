@@ -99,11 +99,12 @@ enum class TxState : uint8_t {
 };
 
 enum class RxState : uint8_t {
-    IDLE_WAIT_FRONT,
-    VERIFY_START_BIT,
-    SAMPLE_DATA_BITS,
-    VERIFY_STOP_BIT,
-    COMPLETE_FRAME
+    IDLE_WAIT_DARK,        // 1. Ожидание темноты (гарантирует, что предыдущий импульс полностью спал)
+    IDLE_WAIT_FRONT,       // 2. Линия темная, ждем фронта старт-бита (0 -> 1)
+    VERIFY_START_BIT,      // 3. Проверка старт-бита в центре (0.5 T)
+    SAMPLE_DATA_BITS,      // 4. Считывание 8 бит данных
+    VERIFY_STOP_BIT,       // 5. Проверка стоп-бита (9.5 T)
+    COMPLETE_FRAME         // 6. Завершение кадра (10.0 T)
 };
 
 enum class RxPacketState : uint8_t {
@@ -133,7 +134,7 @@ uint32_t pingStartTimeMs = 0;
 // ============================================================================
 // ПЕРЕМЕННЫЕ ПРИЕМНИКА (RX ENGINE)
 // ============================================================================
-RxState rxState = RxState::IDLE_WAIT_FRONT;
+RxState rxState = RxState::IDLE_WAIT_DARK;
 RxPacketState rxPacketState = RxPacketState::PAYLOAD;
 
 uint32_t rxFrameStartUs = 0;
@@ -548,9 +549,20 @@ void updateRxEngine() {
     uint32_t currentUs = micros();
 
     switch (rxState) {
+        case RxState::IDLE_WAIT_DARK: {
+            int val = analogRead(Config::PIN_RX);
+            // Перед началом любого приема канал ОБЯЗАН быть темным (ниже динамического порога).
+            // Если лазер горит непрерывно или спадает хвост импульса — ждем темноты.
+            if (val < dynamicThreshold) {
+                rxState = RxState::IDLE_WAIT_FRONT;
+            }
+            break;
+        }
+
         case RxState::IDLE_WAIT_FRONT: {
             int val = analogRead(Config::PIN_RX);
-            if (val > (ambientNoiseLevel + Config::TRIGGER_MARGIN)) {
+            // Фронт старт-бита: переход 0 -> 1 (луч включился и превысил порог)
+            if (val >= dynamicThreshold) {
                 rxFrameStartUs = currentUs;
                 rxState = RxState::VERIFY_START_BIT;
             }
@@ -561,10 +573,13 @@ void updateRxEngine() {
             uint32_t targetUs = rxFrameStartUs + (Config::BIT_PERIOD_US / 2);
             if ((long)(currentUs - targetUs) >= 0) {
                 int sample = analogRead(Config::PIN_RX);
-                if (sample <= (ambientNoiseLevel + Config::MIN_SIGNAL_DELTA)) {
-                    rxState = RxState::IDLE_WAIT_FRONT;
+                // В центре старт-бита уровень ОБЯЗАН быть выше порога!
+                // Если это была случайная короткая помеха — сбрасываем в ожидание темноты
+                if (sample < dynamicThreshold) {
+                    rxState = RxState::IDLE_WAIT_DARK;
                 } else {
                     peakLightAdc = sample;
+                    // Адаптивно подстраиваем порог ровно посередине между темнотой и лучом
                     dynamicThreshold = (ambientNoiseLevel + peakLightAdc) / 2;
                     hysteresisVal = max(4, (peakLightAdc - ambientNoiseLevel) / 10);
 
@@ -612,18 +627,7 @@ void updateRxEngine() {
         case RxState::VERIFY_STOP_BIT: {
             uint32_t stopTargetUs = rxFrameStartUs + (Config::BIT_PERIOD_US * 19 / 2);
             if ((long)(currentUs - stopTargetUs) >= 0) {
-                int stopAdc = analogRead(Config::PIN_RX);
-                // Для лазера: допускаем небольшой хвост сигнала (спад не мгновенный),
-                // поэтому проверяем с запасом на гистерезис
-                bool isStopValid = (stopAdc < (dynamicThreshold + hysteresisVal));
-
-                if (isStopValid) {
-                    rxState = RxState::COMPLETE_FRAME;
-                } else {
-                    // Если стоп-бит не чистый — всё равно принимаем байт,
-                    // CRC-8 отсеет ошибочные данные на уровне пакета
-                    rxState = RxState::COMPLETE_FRAME;
-                }
+                rxState = RxState::COMPLETE_FRAME;
             }
             break;
         }
@@ -632,7 +636,10 @@ void updateRxEngine() {
             uint32_t frameEndUs = rxFrameStartUs + (Config::BIT_PERIOD_US * 10);
             if ((long)(currentUs - frameEndUs) >= 0) {
                 processReceivedByte(rxReconstructedByte);
-                rxState = RxState::IDLE_WAIT_FRONT;
+                // КРИТИЧНО: после приема байта ОБЯЗАТЕЛЬНО переходим в IDLE_WAIT_DARK!
+                // Приемник НЕ начнет принимать следующий байт, пока луч не погаснет.
+                // Это предотвращает зацикливание и бесконечный прием фантомных байтов!
+                rxState = RxState::IDLE_WAIT_DARK;
             }
             break;
         }
