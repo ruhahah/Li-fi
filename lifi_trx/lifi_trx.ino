@@ -548,12 +548,32 @@ void updateTxEngine() {
 void updateRxEngine() {
     uint32_t currentUs = micros();
 
+    // Автоматическая адаптация к комнатному свету в моменты покоя
+    static uint32_t lastBaselineTrackMs = 0;
+    if (!rxIsReceivingMessage && (rxState == RxState::IDLE_WAIT_FRONT || rxState == RxState::IDLE_WAIT_DARK)) {
+        if (millis() - lastBaselineTrackMs >= 100) {
+            lastBaselineTrackMs = millis();
+            int curBg = analogRead(Config::PIN_RX);
+            if (curBg < dynamicThreshold) {
+                ambientNoiseLevel = (ambientNoiseLevel * 3 + curBg) / 4;
+                int expectedPeak = max(peakLightAdc, ambientNoiseLevel + 150);
+                dynamicThreshold = ambientNoiseLevel + (int)(((long)(expectedPeak - ambientNoiseLevel) * 65) / 100);
+            }
+        }
+    }
+
     switch (rxState) {
         case RxState::IDLE_WAIT_DARK: {
             int val = analogRead(Config::PIN_RX);
             // Перед началом любого приема канал ОБЯЗАН быть темным (ниже динамического порога).
-            // Если лазер горит непрерывно или спадает хвост импульса — ждем темноты.
             if (val < dynamicThreshold) {
+                rxState = RxState::IDLE_WAIT_FRONT;
+            } else if ((long)(currentUs - rxFrameStartUs) > (long)(Config::BIT_PERIOD_US * 5)) {
+                // Защита от зависания: если свет не падает дольше 5 периодов бита (например, включили люстру),
+                // пересчитываем порог и разблокируем прием
+                ambientNoiseLevel = val;
+                peakLightAdc = max(1000, ambientNoiseLevel + 150);
+                dynamicThreshold = ambientNoiseLevel + (int)(((long)(peakLightAdc - ambientNoiseLevel) * 65) / 100);
                 rxState = RxState::IDLE_WAIT_FRONT;
             }
             break;
@@ -574,7 +594,6 @@ void updateRxEngine() {
             if ((long)(currentUs - targetUs) >= 0) {
                 int sample = analogRead(Config::PIN_RX);
                 // В центре старт-бита уровень ОБЯЗАН быть выше порога!
-                // Если это была случайная короткая помеха — сбрасываем в ожидание темноты
                 if (sample < dynamicThreshold) {
                     rxState = RxState::IDLE_WAIT_DARK;
                 } else {
@@ -639,9 +658,7 @@ void updateRxEngine() {
             uint32_t frameEndUs = rxFrameStartUs + (Config::BIT_PERIOD_US * 10);
             if ((long)(currentUs - frameEndUs) >= 0) {
                 processReceivedByte(rxReconstructedByte);
-                // КРИТИЧНО: после приема байта ОБЯЗАТЕЛЬНО переходим в IDLE_WAIT_DARK!
-                // Приемник НЕ начнет принимать следующий байт, пока луч не погаснет.
-                // Это предотвращает зацикливание и бесконечный прием фантомных байтов!
+                // После приема кадра переходим в ожидание темноты
                 rxState = RxState::IDLE_WAIT_DARK;
             }
             break;
@@ -726,8 +743,15 @@ void processReceivedByte(uint8_t byteVal) {
         return;
     }
 
-    // Выводим точку в консоль за каждый принятый байт
-    Serial.print(F("."));
+    // Выводим принятый байт в реальном времени (HEX и символ)
+    Serial.print(F(" 0x"));
+    if (byteVal < 16) Serial.print(F("0"));
+    Serial.print(byteVal, HEX);
+    if (byteVal >= 32 && byteVal <= 126) {
+        Serial.print(F("('"));
+        Serial.print((char)byteVal);
+        Serial.print(F("')"));
+    }
 
     // Сохраняем сырой байт в буфер
     if (rxRawIndex < Config::RX_BUFFER_SIZE - 1) {
