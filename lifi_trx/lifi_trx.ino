@@ -375,20 +375,19 @@ void handleSerialInput() {
                     int cur = analogRead(Config::PIN_RX);
                     int delta = cur - ambientNoiseLevel;
                     Serial.println(F("\n--- [ДИАГНОСТИКА СИГНАЛА АЦП A0] ---"));
-                    Serial.print(F("Текущий уровень АЦП:  ")); Serial.println(cur);
-                    Serial.print(F("Фоновая темнота:      ")); Serial.println(ambientNoiseLevel);
-                    Serial.print(F("Амплитуда луча (ΔV):  ")); Serial.println(delta);
-                    Serial.print(F("Порог срабатывания:   ")); Serial.println(ambientNoiseLevel + Config::TRIGGER_MARGIN);
-                    if (delta >= Config::MIN_SIGNAL_DELTA) {
-                        Serial.println(F("СТАТУС: [СИГНАЛ В НОРМЕ] Луч уверенно регистрируется!"));
-                    } else if (delta > 0) {
-                        Serial.println(F("СТАТУС: [СЛАБЫЙ СИГНАЛ] Амплитуды недостаточно для надежного приема."));
-                        Serial.println(F("СОВЕТ: Точнее направьте лазер в фотодиод или увеличьте резистор подтяжки (5-20 кОм)."));
-                    } else if (delta < -20) {
-                        Serial.println(F("СТАТУС: [ИНВЕРТИРОВАННАЯ ПОЛЯРНОСТЬ] При свете АЦП падает, а не растет!"));
-                        Serial.println(F("СОВЕТ: Поменяйте выводы фотодиода (Катод -> 5V, Анод -> A0, Резистор -> GND)."));
+                    Serial.print(F("Текущий уровень АЦП:   ")); Serial.println(cur);
+                    Serial.print(F("Фоновый свет комнаты:  ")); Serial.println(ambientNoiseLevel);
+                    Serial.print(F("Порог срабатывания:    ")); Serial.println(dynamicThreshold);
+                    Serial.print(F("Разница с фоном (ΔV):  ")); Serial.println(delta);
+
+                    if (cur >= dynamicThreshold) {
+                        Serial.println(F("СТАТУС: [ЛАЗЕР ПОЙМАН!] Уровень уверенно выше порога. Прием готов!"));
+                    } else if (delta >= -60 && delta <= 60) {
+                        Serial.println(F("СТАТУС: [ПОКОЙ / ТЕМНОТА] Лазер выключен. Приемник ждет передачу."));
+                    } else if (delta < -60) {
+                        Serial.println(F("СТАТУС: [ПОКОЙ] Комната чуть темнее калибровки (автотрекинг плавно подстроит фон)."));
                     } else {
-                        Serial.println(F("СТАТУС: [НЕТ СИГНАЛА] Фотодиод не видит свет лазера."));
+                        Serial.println(F("СТАТУС: [СЛАБЫЙ СИГНАЛ] Свет есть, но порог еще не достигнут."));
                     }
                     Serial.println(F("------------------------------------\n"));
                     return;
@@ -560,6 +559,19 @@ void updateRxEngine() {
         }
 
         case RxState::IDLE_WAIT_FRONT: {
+            // Адаптивное отслеживание фонового освещения комнаты в моменты тишины
+            static uint32_t lastBaselineTrackMs = 0;
+            if (!rxIsReceivingMessage && (millis() - lastBaselineTrackMs >= 60)) {
+                lastBaselineTrackMs = millis();
+                int curBg = analogRead(Config::PIN_RX);
+                // Если луч выключен (уровень ниже порога), плавно подтягиваем фон к свету в комнате
+                if (curBg < dynamicThreshold) {
+                    ambientNoiseLevel = (ambientNoiseLevel * 7 + curBg) / 8;
+                    int expectedPeak = max(peakLightAdc, ambientNoiseLevel + 150);
+                    dynamicThreshold = (ambientNoiseLevel + expectedPeak) / 2;
+                }
+            }
+
             int val = analogRead(Config::PIN_RX);
             // Фронт старт-бита: переход 0 -> 1 (луч включился и превысил порог)
             if (val >= dynamicThreshold) {
@@ -853,10 +865,13 @@ void calibrateDarkness() {
     }
 
     ambientNoiseLevel = sum / SAMPLES;
-    dynamicThreshold = ambientNoiseLevel + 30;
+    peakLightAdc = max(1000, ambientNoiseLevel + 200);
+    dynamicThreshold = (ambientNoiseLevel + peakLightAdc) / 2;
 
-    Serial.print(F("[КАЛИБРОВКА] Фоновая темнота: "));
+    Serial.print(F("[КАЛИБРОВКА] Фоновый свет комнаты: "));
     Serial.print(ambientNoiseLevel);
+    Serial.print(F(" | Порог приема: "));
+    Serial.print(dynamicThreshold);
     Serial.println(F(" (ADC 0..1023)\n"));
 }
 
