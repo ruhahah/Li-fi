@@ -30,15 +30,17 @@ namespace Config {
     // Скорость: 45 бод (22.2 мс на бит)
     constexpr uint16_t BAUD_RATE = 45;
     constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 22 222 мкс
-    constexpr uint32_t GUARD_PERIOD_US = 3000;             // Защитная пауза: 3 мс
+    // Защитная пауза: 5 мс (увеличена для лазера — чёткий спад импульса)
+    constexpr uint32_t GUARD_PERIOD_US = 5000;
 
     constexpr size_t TX_QUEUE_SIZE = 256;                  // Размер очереди TX
     constexpr size_t RX_BUFFER_SIZE = 256;                 // Размер буфера RX
-    constexpr uint32_t MESSAGE_TIMEOUT_MS = 300;           // Таймаут тишины: 300 мс
+    constexpr uint32_t MESSAGE_TIMEOUT_MS = 400;           // Таймаут тишины: 400 мс
 
     constexpr int TRIGGER_MARGIN = 15;                     // Порог старт-триггера лазерного импульса
     constexpr int MIN_SIGNAL_DELTA = 20;                   // Минимальная амплитуда лазерного луча
-    constexpr int32_t VOTING_OFFSETS_US[3] = {-1500, 0, 1500}; // 3X Оверсэмплинг
+    // Оверсэмплинг ±800 мкс — уменьшен для лазера (быстрый фронт, нет нужды в широком окне)
+    constexpr int32_t VOTING_OFFSETS_US[3] = {-800, 0, 800};
 
     // Управляющие байты протокола ARQ и PING
     constexpr uint8_t CTRL_ACK       = 0x06;               // Байт подтверждения ACK
@@ -599,12 +601,16 @@ void updateRxEngine() {
             uint32_t stopTargetUs = rxFrameStartUs + (Config::BIT_PERIOD_US * 19 / 2);
             if ((long)(currentUs - stopTargetUs) >= 0) {
                 int stopAdc = analogRead(Config::PIN_RX);
-                bool isStopValid = (stopAdc < dynamicThreshold);
+                // Для лазера: допускаем небольшой хвост сигнала (спад не мгновенный),
+                // поэтому проверяем с запасом на гистерезис
+                bool isStopValid = (stopAdc < (dynamicThreshold + hysteresisVal));
 
                 if (isStopValid) {
                     rxState = RxState::COMPLETE_FRAME;
                 } else {
-                    rxState = RxState::IDLE_WAIT_FRONT;
+                    // Если стоп-бит не чистый — всё равно принимаем байт,
+                    // CRC-8 отсеет ошибочные данные на уровне пакета
+                    rxState = RxState::COMPLETE_FRAME;
                 }
             }
             break;
