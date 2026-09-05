@@ -1,9 +1,9 @@
 /*
  * ============================================================================
- * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
+ * ПРОЕКТ: Li-Fi / Laser Односторонняя оптическая связь
  * МОДУЛЬ: ПРИЕМНИК (RX) - АВТОАДАПТАЦИЯ + КИРИЛЛИЦА + CRC-8 + ТЕЛЕМЕТРИЯ SNR
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
- * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор -> GND)
+ * ДАТЧИК: Фотодиод BPW24 (Катод -> 5V, Анод -> A0, Резистор 5-10 кОм -> GND)
  * ============================================================================
  */
 
@@ -26,6 +26,10 @@ constexpr uint32_t MESSAGE_TIMEOUT_MS = 500;
 uint32_t lastCharTime = 0;
 uint32_t messageStartTime = 0;
 bool isReceivingMessage = false;
+
+// Режим юстировки / мониторинга лазерного луча
+bool isMonitoringLaser = false;
+uint32_t lastMonitorTimeMs = 0;
 
 // Состояние приема пакета
 enum RxPacketState {
@@ -66,20 +70,24 @@ void setup() {
     delay(500);
 
     Serial.println(F("\n============================================================"));
-    Serial.println(F("  >>> Li-Fi ПРИЕМНИК (RX) [ТЕЛЕМЕТРИЯ SNR + UTF-8 + CRC] <<<"));
+    Serial.println(F("  >>> Li-Fi / LASER ПРИЕМНИК (RX) [SNR + UTF-8 + CRC-8] <<< "));
     Serial.println(F("============================================================"));
-    Serial.print(F("[INFO] Скорость Li-Fi: "));
+    Serial.print(F("[INFO] Скорость Li-Fi:        "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
+    Serial.println(F("[INFO] Приемник оптимизирован под лазерный луч (высокий SNR)."));
     Serial.println(F("[INFO] Включен расчет оптического контраста, SNR (дБ) и скорости."));
 
     // Замеряем базовый уровень темноты
     calibrateDarkness();
 
     Serial.println(F("------------------------------------------------------------"));
-    Serial.println(F("Приемник готов к работе...\n"));
+    Serial.println(F("Команды:"));
+    Serial.println(F("  - 'l' - вкл/выкл монитор юстировки луча в реальном времени"));
+    Serial.println(F("  - 'c' - калибровка темноты, 'r' - мгновенный замер АЦП"));
+    Serial.println(F("Приемник готов к приему лазерного луча...\n"));
 }
 
 // ==========================================
@@ -87,6 +95,31 @@ void setup() {
 // ==========================================
 void loop() {
     handleSerialCommands();
+
+    // Режим юстировки / мониторинга лазерного луча
+    if (isMonitoringLaser) {
+        if (millis() - lastMonitorTimeMs >= 200) {
+            lastMonitorTimeMs = millis();
+            int cur = analogRead(RX_PIN);
+            Serial.print(F("[ЮСТИРОВКА RX] АЦП: "));
+            if (cur < 1000) Serial.print(F(" "));
+            if (cur < 100) Serial.print(F(" "));
+            if (cur < 10) Serial.print(F(" "));
+            Serial.print(cur);
+            Serial.print(F(" ["));
+            int bars = map(constrain(cur, ambientNoiseLevel, 1023), ambientNoiseLevel, 1023, 0, 20);
+            for (int b = 0; b < 20; b++) {
+                Serial.print(b < bars ? '=' : ' ');
+            }
+            Serial.print(F("] "));
+            if (cur > (ambientNoiseLevel + 20)) {
+                Serial.println(F(">> ЛУЧ ПОЙМАН <<"));
+            } else {
+                Serial.println(F("нет луча"));
+            }
+        }
+        return;
+    }
 
     // Проверка появления оптического импульса (триггер старт-бита)
     if (checkStartTrigger()) {
@@ -128,7 +161,7 @@ uint8_t calculateCRC8(const uint8_t* data, size_t len) {
 
 bool checkStartTrigger() {
     int val = analogRead(RX_PIN);
-    return (val > (ambientNoiseLevel + 12));
+    return (val > (ambientNoiseLevel + 15));
 }
 
 bool sampleBitWithVoting(uint32_t bitCenterUs) {
@@ -159,7 +192,7 @@ bool receiveByte(uint8_t& outByte) {
     while ((long)(micros() - startCenterUs) < 0);
 
     int startSample = analogRead(RX_PIN);
-    if (startSample <= (ambientNoiseLevel + 15)) {
+    if (startSample <= (ambientNoiseLevel + 20)) {
         return false; // Ложный шум
     }
 
@@ -356,7 +389,7 @@ void calibrateDarkness() {
     }
 
     ambientNoiseLevel = sum / SAMPLES;
-    thresholdValue = ambientNoiseLevel + 25;
+    thresholdValue = ambientNoiseLevel + 30;
 
     Serial.print(F("[КАЛИБРОВКА] Фоновая темнота: "));
     Serial.print(ambientNoiseLevel);
@@ -366,7 +399,17 @@ void calibrateDarkness() {
 void handleSerialCommands() {
     if (Serial.available() > 0) {
         char cmd = Serial.read();
-        if (cmd == 'c' || cmd == 'C') {
+        if (cmd == 'l' || cmd == 'L') {
+            isMonitoringLaser = !isMonitoringLaser;
+            if (isMonitoringLaser) {
+                Serial.println(F("\n========================================================"));
+                Serial.println(F(">>> [РЕЖИМ ЮСТИРОВКИ RX ВКЛЮЧЕН] <<<"));
+                Serial.println(F("Направляйте лазер на фотодиод. Для выхода введите 'l'."));
+                Serial.println(F("========================================================"));
+            } else {
+                Serial.println(F("\n>>> [РЕЖИМ ЮСТИРОВКИ RX ВЫКЛЮЧЕН]. Приемник готов.\n"));
+            }
+        } else if (cmd == 'c' || cmd == 'C') {
             calibrateDarkness();
         } else if (cmd == 'r' || cmd == 'R') {
             int cur = analogRead(RX_PIN);

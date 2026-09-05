@@ -1,9 +1,9 @@
 /*
  * ============================================================================
- * ПРОЕКТ: Li-Fi Односторонняя оптическая связь (Visible Light Communication)
+ * ПРОЕКТ: Li-Fi / Laser Односторонняя оптическая связь
  * МОДУЛЬ: ПЕРЕДАТЧИК (TX) - ПОЛНАЯ ПОДДЕРЖКА КИРИЛЛИЦЫ (UTF-8) + CRC-8
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
- * СВЕТОДИОД: Модуль LED на Pin 13
+ * ПЕРЕДАТЧИК: Лазерный модуль (KY-008 650нм 5мВт / лазерный диод) на Pin 13
  * ============================================================================
  */
 
@@ -12,12 +12,14 @@
 // ==========================================
 // КОНФИГУРАЦИЯ И НАСТРОЙКИ СКОРОСТИ
 // ==========================================
-constexpr uint8_t TX_PIN = 13;                         // Цифровой пин управления LED
+constexpr uint8_t TX_PIN = 13;                         // Цифровой пин управления лазером (KY-008)
 constexpr uint16_t BAUD_RATE = 30;                     // Скорость: 30 бит/с (33.3 мс на бит)
 constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
 
 // Межсимвольная защитная пауза
 constexpr uint32_t INTER_BYTE_DELAY_US = BIT_PERIOD_US;
+
+bool isLaserAiming = false;                            // Состояние постоянного свечения лазера для наведения
 
 // ==========================================
 // ПРОТОТИПЫ ФУНКЦИЙ
@@ -31,23 +33,26 @@ void sendString(const char* str);
 // ==========================================
 void setup() {
     pinMode(TX_PIN, OUTPUT);
-    digitalWrite(TX_PIN, LOW); // Светодиод выключен в покое
+    digitalWrite(TX_PIN, LOW); // Лазер выключен в покое
 
     Serial.begin(115200);
     delay(500);
 
     Serial.println(F("\n======================================================="));
-    Serial.println(F("     >>> Li-Fi ПЕРЕДАТЧИК (TX) [РУССКИЙ + ENGLISH] <<< "));
+    Serial.println(F("  >>> Li-Fi / LASER ПЕРЕДАТЧИК (TX) [РУССКИЙ/ENG + CRC] <<<"));
     Serial.println(F("======================================================="));
-    Serial.print(F("[INFO] Скорость Li-Fi: "));
+    Serial.print(F("[INFO] Скорость Li-Fi:        "));
     Serial.print(BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
-    Serial.println(F("[INFO] Поддержка языков: РУССКИЙ (UTF-8) и ENGLISH."));
-    Serial.println(F("[INFO] Контроль целостности: CRC-8."));
+    Serial.println(F("[INFO] Источник света:        Лазер (KY-008 650нм 5мВт)"));
+    Serial.println(F("[INFO] Поддержка языков:      РУССКИЙ (UTF-8) и ENGLISH."));
+    Serial.println(F("[INFO] Контроль целостности:  CRC-8."));
     Serial.println(F("-------------------------------------------------------"));
-    Serial.println(F("Введите фразу на русском или английском и нажмите Enter:\n"));
+    Serial.println(F("Команды:"));
+    Serial.println(F("  - Введите текст и нажмите Enter для отправки"));
+    Serial.println(F("  - Введите 'l' или 'laser' для вкл/выкл лазера (юстировка)\n"));
 }
 
 // ==========================================
@@ -59,6 +64,26 @@ void loop() {
         input.trim();
         
         if (input.length() > 0) {
+            // Режим юстировки / наведения лазера
+            if (input.equalsIgnoreCase("laser") || input.equalsIgnoreCase("l")) {
+                isLaserAiming = !isLaserAiming;
+                digitalWrite(TX_PIN, isLaserAiming ? HIGH : LOW);
+                if (isLaserAiming) {
+                    Serial.println(F("\n[ЛАЗЕР]: ВКЛЮЧЕН НЕПРЕРЫВНО для наведения на фотодиод."));
+                    Serial.println(F("[ЛАЗЕР]: Направьте луч в центр приемника. Для выключения введите 'l'.\n"));
+                } else {
+                    Serial.println(F("\n[ЛАЗЕР]: ВЫКЛЮЧЕН. Передатчик готов к отправке текста.\n"));
+                }
+                return;
+            }
+
+            // Если лазер был включен в режиме прицеливания, выключаем перед посылкой
+            if (isLaserAiming) {
+                isLaserAiming = false;
+                digitalWrite(TX_PIN, LOW);
+                delay(50);
+            }
+
             // Расчет контрольной суммы от UTF-8 байтов
             uint8_t crc = calculateCRC8(reinterpret_cast<const uint8_t*>(input.c_str()), input.length());
 

@@ -1,21 +1,20 @@
 /*
  * ============================================================================
- * ПРОЕКТ: Li-Fi Полнодуплексная оптическая связь (Visible Light Communication)
+ * ПРОЕКТ: Li-Fi Полнодуплексная оптическая связь (Laser / VLC)
  * МОДУЛЬ: ТРАНСИВЕР (FULL-DUPLEX + PING + СЖАТИЕ ТЕКСТА + БЫСТРЫЙ ARQ)
  * ПЛАТФОРМА: Arduino Uno (ATmega328P)
  * 
  * АППАРАТНАЯ КОНФИГУРАЦИЯ:
- *   - TX (Передатчик):  LED на Pin 13 (через резистор 150-220 Ом на GND)
+ *   - TX (Передатчик):  Лазерный модуль (KY-008 650нм 5мВт / лазерный диод) на Pin 13
  *   - RX (Приемник):    Фотодиод BPW24 на Pin A0 (Катод -> 5V, Анод -> A0, Резистор -> GND)
  *   - Связь с ПК:       Hardware Serial UART (115200 baud)
  * 
- * НОВЫЕ ВОЗМОЖНОСТИ:
- *   1. Оптический Ping (команда 'ping'):
- *      - Замеряет точное время отклика (RTT в мс) по лучу Li-Fi.
- *   2. Сжатие текста (Li-Fi Lossless Compression):
- *      - Сжимает русские буквы UTF-8 в 2 раза (убирает избыточные префиксы 0xD0/0xD1).
- *      - Передача русских фраз становится в 2 раза быстрее!
- *   3. Полнодуплексный неблокирующий движок (45 бод, быстрый ARQ).
+ * ОСОБЕННОСТИ:
+ *   - Лазерный оптический канал с высокой коллимацией и дальностью.
+ *   - Режим юстировки лазера (команда 'l' или 'laser') со шкалой уровня сигнала.
+ *   - Оптический Ping (команда 'ping') с замером RTT.
+ *   - Аппаратное сжатие кириллицы UTF-8 (в 2 раза быстрее).
+ *   - Надежный протокол ARQ (автоподтверждение ACK и автоповтор).
  * ============================================================================
  */
 
@@ -25,8 +24,8 @@
 // КОНФИГУРАЦИЯ И КОНСТАНТЫ
 // ============================================================================
 namespace Config {
-    constexpr uint8_t PIN_TX = 13;                         // Оптический передатчик (LED)
-    constexpr uint8_t PIN_RX = A0;                         // Оптический приемник (Фотодиод)
+    constexpr uint8_t PIN_TX = 13;                         // Оптический передатчик: Лазер (KY-008)
+    constexpr uint8_t PIN_RX = A0;                         // Оптический приемник: Фотодиод BPW24
 
     // Скорость: 45 бод (22.2 мс на бит)
     constexpr uint16_t BAUD_RATE = 45;
@@ -37,8 +36,8 @@ namespace Config {
     constexpr size_t RX_BUFFER_SIZE = 256;                 // Размер буфера RX
     constexpr uint32_t MESSAGE_TIMEOUT_MS = 300;           // Таймаут тишины: 300 мс
 
-    constexpr int TRIGGER_MARGIN = 10;                     // Порог старт-триггера
-    constexpr int MIN_SIGNAL_DELTA = 12;                   // Минимальная амплитуда луча
+    constexpr int TRIGGER_MARGIN = 15;                     // Порог старт-триггера лазерного импульса
+    constexpr int MIN_SIGNAL_DELTA = 20;                   // Минимальная амплитуда лазерного луча
     constexpr int32_t VOTING_OFFSETS_US[3] = {-1500, 0, 1500}; // 3X Оверсэмплинг
 
     // Управляющие байты протокола ARQ и PING
@@ -155,6 +154,10 @@ bool rxIsReceivingMessage = false;
 long totalLightAdcSum = 0;
 int lightSamplesCount = 0;
 
+// Режим юстировки лазера (постоянный луч + вывод уровня сигнала)
+bool isLaserAimingMode = false;
+uint32_t lastAimingPrintMs = 0;
+
 // ============================================================================
 // ПРОТОТИПЫ
 // ============================================================================
@@ -166,6 +169,8 @@ void updateTxEngine();
 void updateRxEngine();
 void handleSerialInput();
 void handleArqTimeouts();
+void toggleLaserAimingMode();
+void updateLaserAiming();
 void sendRawPacket(const uint8_t* payload, size_t len, uint8_t crc);
 void sendAckFrame(uint8_t controlByte);
 void sendPingRequest();
@@ -187,15 +192,16 @@ void setup() {
     delay(400);
 
     Serial.println(F("\n============================================================"));
-    Serial.println(F(" >>> Li-Fi ТРАНСИВЕР [FULL-DUPLEX + PING + СЖАТИЕ + ARQ] <<< "));
+    Serial.println(F("  [Li-Fi / LASER ТРАНСИВЕР: FULL-DUPLEX + PING + ARQ]       "));
     Serial.println(F("============================================================"));
     Serial.print(F("[INFO] Скорость Li-Fi:        "));
     Serial.print(Config::BAUD_RATE);
     Serial.print(F(" бод | Длительность бита: "));
     Serial.print(Config::BIT_PERIOD_US / 1000);
     Serial.println(F(" мс"));
-    Serial.println(F("[INFO] Сжатие данных:          ВКЛЮЧЕНО (Ускорение кириллицы x2)"));
-    Serial.println(F("[INFO] Оптический Ping:        ВКЛЮЧЕНО (Команда 'ping')"));
+    Serial.println(F("[INFO] Оптический канал:       Лазерный луч (KY-008 / 650нм 5мВт)"));
+    Serial.println(F("[INFO] Сжатие данных:          ВКЛЮЧЕНО (Кириллица x2)"));
+    Serial.println(F("[INFO] Оптический Ping:        ВКЛЮЧЕНО (команда 'ping')"));
     Serial.println(F("[INFO] Режим связи:            FULL-DUPLEX (Одновременный TX/RX)"));
 
     calibrateDarkness();
@@ -203,7 +209,8 @@ void setup() {
     Serial.println(F("------------------------------------------------------------"));
     Serial.println(F("Команды:"));
     Serial.println(F("  - Введите текст для отправки"));
-    Serial.println(F("  - 'ping' - измерить круговую задержку луча (RTT)"));
+    Serial.println(F("  - 'l' или 'laser' - режим юстировки/наведения луча"));
+    Serial.println(F("  - 'ping' - измерить задержку луча (RTT)"));
     Serial.println(F("  - 'c' - калибровка темноты, 'r' - замер АЦП"));
     Serial.println(F("------------------------------------------------------------\n"));
 }
@@ -213,6 +220,13 @@ void setup() {
 // ============================================================================
 void loop() {
     handleSerialInput();
+
+    // Если включен режим юстировки лазера, обновляем шкалу сигнала
+    if (isLaserAimingMode) {
+        updateLaserAiming();
+        return;
+    }
+
     updateTxEngine();
     updateRxEngine();
 
@@ -224,17 +238,11 @@ void loop() {
 }
 
 // ============================================================================
-// АЛГОРИТМ БЫСТРОГО СЖАТИЯ (КИРИЛЛИЦА UTF-8 PACKING)
+// АЛГОРИТМ СЖАТИЯ (КИРИЛЛИЦА UTF-8 PACKING)
 // ============================================================================
-
-/**
- * @brief Сжатие UTF-8 текста: убирает повторяющиеся префиксы 0xD0/0xD1
- * Сжимает русские слова ровно в 2 раза!
- */
 size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxDstLen) {
     if (maxDstLen < 2) return 0;
     
-    // Первый байт - флаг сжатия
     dst[0] = Config::FLAG_COMPRESSED;
     size_t dIdx = 1;
 
@@ -244,7 +252,6 @@ size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxD
         if (c1 == 0xD0 && i + 1 < srcLen) {
             uint8_t c2 = static_cast<uint8_t>(src[i + 1]);
             if (c2 >= 0x80 && c2 <= 0xBF) {
-                // Сжимаем пару 0xD0 + c2 в один токен (0x80..0xBF)
                 dst[dIdx++] = c2;
                 i++;
                 continue;
@@ -252,7 +259,6 @@ size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxD
         } else if (c1 == 0xD1 && i + 1 < srcLen) {
             uint8_t c2 = static_cast<uint8_t>(src[i + 1]);
             if (c2 >= 0x80 && c2 <= 0xBF) {
-                // Сжимаем пару 0xD1 + c2 в один токен (0xC0..0xFF)
                 dst[dIdx++] = (c2 + 0x40);
                 i++;
                 continue;
@@ -265,9 +271,6 @@ size_t compressPayload(const char* src, size_t srcLen, uint8_t* dst, size_t maxD
     return dIdx;
 }
 
-/**
- * @brief Распаковка сжатого потока обратно в чистый UTF-8
- */
 size_t decompressPayload(const uint8_t* src, size_t srcLen, char* dst, size_t maxDstLen) {
     if (srcLen == 0 || maxDstLen == 0) return 0;
 
@@ -278,11 +281,9 @@ size_t decompressPayload(const uint8_t* src, size_t srcLen, char* dst, size_t ma
         uint8_t b = src[sIdx++];
 
         if (b >= 0x80 && b <= 0xBF) {
-            // Восстанавливаем префикс 0xD0
             dst[dIdx++] = static_cast<char>(0xD0);
             dst[dIdx++] = static_cast<char>(b);
         } else if (b >= 0xC0 && b <= 0xFF) {
-            // Восстанавливаем префикс 0xD1
             dst[dIdx++] = static_cast<char>(0xD1);
             dst[dIdx++] = static_cast<char>(b - 0x40);
         } else {
@@ -333,7 +334,7 @@ void sendPingRequest() {
     pingStartTimeMs = millis();
 
     Serial.println(F("\n========================================================"));
-    Serial.println(F(">>> [OPTICAL PING]: Отправка эхо-запроса по лучу Li-Fi..."));
+    Serial.println(F("[OPTICAL PING]: Отправка эхо-запроса по лучу Li-Fi..."));
     Serial.println(F("========================================================"));
 
     txQueue.push(Config::CTRL_PING_REQ);
@@ -349,6 +350,12 @@ void handleSerialInput() {
         input.trim();
 
         if (input.length() > 0) {
+            // Режим юстировки лазера (наведение луча)
+            if (input.equalsIgnoreCase("laser") || input.equalsIgnoreCase("l")) {
+                toggleLaserAimingMode();
+                return;
+            }
+
             // Команда PING
             if (input.equalsIgnoreCase("ping")) {
                 sendPingRequest();
@@ -399,7 +406,7 @@ void handleSerialInput() {
             Serial.print(F(" байт (Экономия: "));
             int saved = 100 - (int)((compLen * 100) / lastSentMessageLen);
             Serial.print(max(0, saved));
-            Serial.println(F("%) 🗜️"));
+            Serial.println(F("%)"));
             Serial.print(F("[TX CRC-8]:     0x"));
             if (crc < 16) Serial.print(F("0"));
             Serial.println(crc, HEX);
@@ -417,7 +424,7 @@ void handleArqTimeouts() {
         if (millis() - pingStartTimeMs > 2000) {
             isWaitingForPingReply = false;
             Serial.println(F("\n********************************************************"));
-            Serial.println(F(">>> [OPTICAL PING]: Таймаут ответа! Луч не дошел до цели ❌"));
+            Serial.println(F("[OPTICAL PING]: Таймаут ответа! Луч не дошел до цели."));
             Serial.println(F("********************************************************\n"));
         }
     }
@@ -430,11 +437,11 @@ void handleArqTimeouts() {
                 ackWaitStartTimeMs = millis();
 
                 Serial.println(F("\n--------------------------------------------------------"));
-                Serial.print(F(">>> [ARQ АВТОПОВТОР]: Таймаут. Повтор пакета (Попытка "));
+                Serial.print(F("[ARQ АВТОПОВТОР]: Таймаут. Повтор пакета (Попытка "));
                 Serial.print(currentRetryCount);
                 Serial.print(F(" из "));
                 Serial.print(Config::MAX_RETRIES);
-                Serial.println(F(")... 🔄"));
+                Serial.println(F(")..."));
                 Serial.println(F("--------------------------------------------------------"));
 
                 uint8_t compBuf[Config::TX_QUEUE_SIZE];
@@ -445,7 +452,7 @@ void handleArqTimeouts() {
             } else {
                 isWaitingForAck = false;
                 Serial.println(F("\n********************************************************"));
-                Serial.println(F(">>> [ДОСТАВКА НЕ УДАЛАСЬ]: Луч перекрыт или нет связи! ❌"));
+                Serial.println(F("[ДОСТАВКА НЕ УДАЛАСЬ]: Луч перекрыт или нет связи."));
                 Serial.println(F("********************************************************\n"));
             }
         }
@@ -631,11 +638,11 @@ void processReceivedByte(uint8_t byteVal) {
             uint32_t rttMs = millis() - pingStartTimeMs;
             Serial.println();
             Serial.println(F("\n========================================================"));
-            Serial.println(F(">>> [OPTICAL PING]: ОТВЕТ ПОЛУЧЕН! ✔"));
-            Serial.print(F("    • RTT (Круговая задержка): "));
+            Serial.println(F(">>> [OPTICAL PING]: ОТВЕТ ПОЛУЧЕН [OK]"));
+            Serial.print(F("    - RTT (Круговая задержка): "));
             Serial.print(rttMs);
             Serial.println(F(" мс"));
-            Serial.println(F("    • Статус оптического луча: СВЯЗЬ АКТИВНА И СТАБИЛЬНА"));
+            Serial.println(F("    - Статус: СВЯЗЬ АКТИВНА И СТАБИЛЬНА"));
             Serial.println(F("========================================================\n"));
         }
         return;
@@ -648,8 +655,8 @@ void processReceivedByte(uint8_t byteVal) {
             uint32_t rttMs = millis() - ackWaitStartTimeMs;
             Serial.println();
             Serial.println(F("\n========================================================"));
-            Serial.print(F(">>> [СТАТУС ДОСТАВКИ]: ПАКЕТ ДОСТАВЛЕН ПОЛУЧАТЕЛЮ! ✔\n"));
-            Serial.print(F(">>> [АРВ-ПОДТВЕРЖДЕНИЕ]: Получен ACK за "));
+            Serial.print(F(">>> [СТАТУС ДОСТАВКИ]: ПАКЕТ ДОСТАВЛЕН ПОЛУЧАТЕЛЮ [OK]\n"));
+            Serial.print(F(">>> [ARQ-ПОДТВЕРЖДЕНИЕ]: Получен ACK за "));
             Serial.print(rttMs / 1000.0f, 2);
             Serial.println(F(" сек"));
             Serial.println(F("========================================================\n"));
@@ -660,7 +667,7 @@ void processReceivedByte(uint8_t byteVal) {
     // 4. Служебный байт NAK
     if (byteVal == Config::CTRL_NAK) {
         if (isWaitingForAck) {
-            Serial.println(F("\n>>> [ARQ]: Получен NAK! Мгновенный повтор..."));
+            Serial.println(F("\n>>> [ARQ]: Получен NAK. Мгновенный повтор..."));
             ackWaitStartTimeMs = 0;
         }
         return;
@@ -686,7 +693,7 @@ void processReceivedByte(uint8_t byteVal) {
         return;
     }
 
-    // Сохраняем сырой байт в буфер для последующей распаковки
+    // Сохраняем сырой байт в буфер
     if (rxRawIndex < Config::RX_BUFFER_SIZE - 1) {
         rxRawBuffer[rxRawIndex++] = byteVal;
     }
@@ -733,7 +740,7 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
     Serial.print(decompressedLen);
     Serial.print(F(" байт (В луче передано: "));
     Serial.print(rxRawIndex);
-    Serial.println(F(" байт) 🗜️"));
+    Serial.println(F(" байт)"));
 
     bool isCrcValid = false;
 
@@ -746,10 +753,10 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
         Serial.println(receivedCRC, HEX);
 
         if (calculatedCRC == receivedCRC) {
-            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [УСПЕШНО - ОШИБОК НЕТ!] ✔"));
+            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [УСПЕШНО - ОШИБОК НЕТ]"));
             isCrcValid = true;
         } else {
-            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [ОШИБКА CRC! ДАННЫЕ ИСКАЖЕНЫ] ❌"));
+            Serial.println(F(">>> [СТАТУС ЦЕЛОСТНОСТИ]:      [ОШИБКА CRC: ДАННЫЕ ИСКАЖЕНЫ]"));
         }
     } else {
         Serial.print(F(">>> [КОНТРОЛЬ CRC-8]:          Таймаут CRC (Расчет: 0x"));
@@ -761,7 +768,7 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
     // ТЕЛЕМЕТРИЯ КАНАЛА
     Serial.println(F("------------------------------------------------------------"));
     Serial.println(F(">>> [МЕТРИКИ ОПТИЧЕСКОГО КАНАЛА LI-FI]:"));
-    Serial.print(F("    • Оптический контраст (ΔV): "));
+    Serial.print(F("    - Оптический контраст (dV): "));
     Serial.print(contrastDelta);
     Serial.print(F(" ADC (Луч: "));
     Serial.print(avgLightAdc);
@@ -769,18 +776,18 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
     Serial.print(ambientNoiseLevel);
     Serial.println(F(")"));
 
-    Serial.print(F("    • SNR (Сигнал/Шум):         "));
+    Serial.print(F("    - SNR (Сигнал/Шум):         "));
     Serial.print(snrDb, 1);
     Serial.print(F(" dB "));
     if (snrDb >= 25.0f) {
-        Serial.println(F("[ОТЛИЧНЫЙ СИГНАЛ] ★★★"));
+        Serial.println(F("[ОТЛИЧНЫЙ СИГНАЛ]"));
     } else if (snrDb >= 16.0f) {
-        Serial.println(F("[ХОРОШИЙ СИГНАЛ] ★★☆"));
+        Serial.println(F("[ХОРОШИЙ СИГНАЛ]"));
     } else {
-        Serial.println(F("[СЛАБЫЙ СИГНАЛ] ☆☆☆"));
+        Serial.println(F("[СЛАБЫЙ СИГНАЛ]"));
     }
 
-    Serial.print(F("    • Эффективная скорость:     "));
+    Serial.print(F("    - Скорость передачи:        "));
     Serial.print(bytesPerSec, 1);
     Serial.print(F(" байт/с ("));
     Serial.print(bitsPerSec, 1);
@@ -800,6 +807,7 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
 // КАЛИБРОВКА ТЕМНОТЫ
 // ==========================================
 void calibrateDarkness() {
+    digitalWrite(Config::PIN_TX, LOW); // Гарантируем отключение своего лазера
     long sum = 0;
     constexpr int SAMPLES = 60;
     int maxVal = 0;
@@ -812,9 +820,61 @@ void calibrateDarkness() {
     }
 
     ambientNoiseLevel = sum / SAMPLES;
-    dynamicThreshold = ambientNoiseLevel + 25;
+    dynamicThreshold = ambientNoiseLevel + 30;
 
     Serial.print(F("[КАЛИБРОВКА] Фоновая темнота: "));
     Serial.print(ambientNoiseLevel);
     Serial.println(F(" (ADC 0..1023)\n"));
 }
+
+// ==========================================
+// РЕЖИМ ЮСТИРОВКИ (НАВЕДЕНИЯ) ЛАЗЕРА
+// ==========================================
+void toggleLaserAimingMode() {
+    isLaserAimingMode = !isLaserAimingMode;
+    if (isLaserAimingMode) {
+        txQueue.clear();
+        txState = TxState::IDLE;
+        rxState = RxState::IDLE_WAIT_FRONT;
+        digitalWrite(Config::PIN_TX, HIGH); // Включаем лазер непрерывно для юстировки
+
+        Serial.println(F("\n========================================================"));
+        Serial.println(F(">>> [РЕЖИМ ЮСТИРОВКИ ЛАЗЕРА ВКЛЮЧЕН] <<<"));
+        Serial.println(F("Красный луч лазера включен непрерывно."));
+        Serial.println(F("Направьте луч на фотодиод приемника, ориентируясь на шкалу АЦП."));
+        Serial.println(F("Для выхода из юстировки введите 'l' или 'laser'."));
+        Serial.println(F("========================================================"));
+    } else {
+        digitalWrite(Config::PIN_TX, LOW); // Выключаем лазер
+        Serial.println(F("\n>>> [РЕЖИМ ЮСТИРОВКИ ВЫКЛЮЧЕН]"));
+        calibrateDarkness();
+        Serial.println(F("Трансивер готов к передаче и приему данных.\n"));
+    }
+}
+
+void updateLaserAiming() {
+    if (millis() - lastAimingPrintMs >= 200) {
+        lastAimingPrintMs = millis();
+        int cur = analogRead(Config::PIN_RX);
+
+        Serial.print(F("[ЮСТИРОВКА] АЦП: "));
+        if (cur < 1000) Serial.print(F(" "));
+        if (cur < 100) Serial.print(F(" "));
+        if (cur < 10) Serial.print(F(" "));
+        Serial.print(cur);
+        Serial.print(F(" ["));
+
+        int bars = map(constrain(cur, ambientNoiseLevel, 1023), ambientNoiseLevel, 1023, 0, 20);
+        for (int b = 0; b < 20; b++) {
+            Serial.print(b < bars ? '=' : ' ');
+        }
+        Serial.print(F("] "));
+
+        if (cur > (ambientNoiseLevel + Config::MIN_SIGNAL_DELTA)) {
+            Serial.println(F(">> ЛУЧ ПОЙМАН <<"));
+        } else {
+            Serial.println(F("нет луча"));
+        }
+    }
+}
+
