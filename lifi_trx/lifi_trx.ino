@@ -27,20 +27,20 @@ namespace Config {
     constexpr uint8_t PIN_TX = 13;                         // Оптический передатчик: Лазер (KY-008)
     constexpr uint8_t PIN_RX = A0;                         // Оптический приемник: Фотодиод BPW24
 
-    // Скорость: 30 бод (33.3 мс на бит) для идеальной стабильности и совместимости с lifi_tx/lifi_rx
-    constexpr uint16_t BAUD_RATE = 30;
-    constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 33 333 мкс
-    // Защитная пауза: 5 мс (для лазера — чистый спад импульса)
-    constexpr uint32_t GUARD_PERIOD_US = 5000;
+    // Скорость: 15 бод (66.6 мс на бит) — даёт фотодиоду полное время на разряд при насыщении лазером
+    constexpr uint16_t BAUD_RATE = 15;
+    constexpr uint32_t BIT_PERIOD_US = 1000000UL / BAUD_RATE; // 66 666 мкс
+    // Защитная пауза между байтами: 10 мс
+    constexpr uint32_t GUARD_PERIOD_US = 10000;
 
     constexpr size_t TX_QUEUE_SIZE = 256;                  // Размер очереди TX
     constexpr size_t RX_BUFFER_SIZE = 256;                 // Размер буфера RX
-    constexpr uint32_t MESSAGE_TIMEOUT_MS = 500;           // Таймаут тишины: 500 мс
+    constexpr uint32_t MESSAGE_TIMEOUT_MS = 800;           // Таймаут тишины: 800 мс
 
     constexpr int TRIGGER_MARGIN = 10;                     // Порог старт-триггера лазерного импульса
     constexpr int MIN_SIGNAL_DELTA = 15;                   // Минимальная амплитуда лазерного луча
-    // Оверсэмплинг ±1200 мкс для 30 бод
-    constexpr int32_t VOTING_OFFSETS_US[3] = {-1200, 0, 1200};
+    // Оверсэмплинг ±2000 мкс для 15 бод
+    constexpr int32_t VOTING_OFFSETS_US[3] = {-2000, 0, 2000};
 
     // Управляющие байты протокола ARQ и PING
     constexpr uint8_t CTRL_ACK       = 0x06;               // Байт подтверждения ACK
@@ -49,7 +49,7 @@ namespace Config {
     constexpr uint8_t CTRL_PING_RESP = 0x04;               // Оптический Ping ответ (EOT)
     constexpr uint8_t FLAG_COMPRESSED = 0x01;              // Маркер сжатого пакета
 
-    constexpr uint32_t ACK_TIMEOUT_MS = 2500;              // Таймаут ожидания ACK
+    constexpr uint32_t ACK_TIMEOUT_MS = 4500;              // Таймаут ожидания ACK (увеличен для 15 бод)
     constexpr uint8_t MAX_RETRIES = 3;                     // Число повторов ARQ
 }
 
