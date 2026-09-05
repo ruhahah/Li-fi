@@ -329,7 +329,7 @@ void sendRawPacket(const uint8_t* payload, size_t len, uint8_t crc) {
 }
 
 void sendAckFrame(uint8_t controlByte) {
-    txQueue.push(controlByte);
+    (void)controlByte; // Отключено: односторонняя отправка без повторов и подтверждений
 }
 
 void sendPingRequest() {
@@ -406,8 +406,8 @@ void handleSerialInput() {
 
             uint8_t crc = calculateCRC8(compBuf, compLen);
 
-            isWaitingForAck = true;
-            ackWaitStartTimeMs = millis();
+            // Отправка строго один раз без повторов
+            isWaitingForAck = false;
             currentRetryCount = 0;
 
             Serial.println(F("\n>>>>>>>>>>>>>> [ TX: ОТПРАВКА СООБЩЕНИЯ ] >>>>>>>>>>>>>>"));
@@ -425,7 +425,6 @@ void handleSerialInput() {
             Serial.print(F("[TX CRC-8]:     0x"));
             if (crc < 16) Serial.print(F("0"));
             Serial.println(crc, HEX);
-            Serial.println(F("[TX Статус]:    Ожидание подтверждения доставки (ACK)..."));
             Serial.println(F("--------------------------------------------------------"));
 
             sendRawPacket(compBuf, compLen, crc);
@@ -434,42 +433,13 @@ void handleSerialInput() {
 }
 
 void handleArqTimeouts() {
-    // 1. Проверка таймаута PING
+    // Проверка таймаута PING
     if (isWaitingForPingReply && txQueue.isEmpty() && txState == TxState::IDLE) {
         if (millis() - pingStartTimeMs > 2000) {
             isWaitingForPingReply = false;
             Serial.println(F("\n********************************************************"));
             Serial.println(F("[OPTICAL PING]: Таймаут ответа! Луч не дошел до цели."));
             Serial.println(F("********************************************************\n"));
-        }
-    }
-
-    // 2. Проверка таймаута ARQ
-    if (isWaitingForAck && txQueue.isEmpty() && txState == TxState::IDLE) {
-        if (millis() - ackWaitStartTimeMs > Config::ACK_TIMEOUT_MS) {
-            if (currentRetryCount < Config::MAX_RETRIES) {
-                currentRetryCount++;
-                ackWaitStartTimeMs = millis();
-
-                Serial.println(F("\n--------------------------------------------------------"));
-                Serial.print(F("[ARQ АВТОПОВТОР]: Таймаут. Повтор пакета (Попытка "));
-                Serial.print(currentRetryCount);
-                Serial.print(F(" из "));
-                Serial.print(Config::MAX_RETRIES);
-                Serial.println(F(")..."));
-                Serial.println(F("--------------------------------------------------------"));
-
-                uint8_t compBuf[Config::TX_QUEUE_SIZE];
-                size_t compLen = compressPayload(lastSentMessage, lastSentMessageLen, compBuf, sizeof(compBuf));
-                uint8_t crc = calculateCRC8(compBuf, compLen);
-
-                sendRawPacket(compBuf, compLen, crc);
-            } else {
-                isWaitingForAck = false;
-                Serial.println(F("\n********************************************************"));
-                Serial.println(F("[ДОСТАВКА НЕ УДАЛАСЬ]: Луч перекрыт или нет связи."));
-                Serial.println(F("********************************************************\n"));
-            }
         }
     }
 }
@@ -854,11 +824,7 @@ void finalizeReceivedMessage(bool hasCRC, uint8_t receivedCRC) {
     Serial.println(F(" бит/с)"));
     Serial.println(F("************************************************************\n"));
 
-    if (isCrcValid) {
-        sendAckFrame(Config::CTRL_ACK);
-    } else {
-        sendAckFrame(Config::CTRL_NAK);
-    }
+    // Подтверждения (ACK/NAK) отключены — передача строго однократная без повторов пакетов
 
     rxRawIndex = 0;
 }
